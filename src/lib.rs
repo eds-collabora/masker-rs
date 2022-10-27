@@ -387,6 +387,123 @@ impl<'a, 'b> ChunkMasker<'a, 'b> {
 #[cfg(test)]
 mod test {
     use super::Masker;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    fn slow_union(input: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        let mut buf1 = Vec::from(input);
+        let mut buf2 = Vec::new();
+        let mut changes = true;
+        while changes {
+            changes = false;
+            for i in 0..buf1.len() {
+                for j in (i + 1)..buf1.len() {
+                    let x1 = std::cmp::max(buf1[i].0, buf1[j].0);
+                    let x2 = std::cmp::min(buf1[i].1, buf1[j].1);
+                    if x1 < x2 {
+                        // overlap
+                        for x in 0..i {
+                            buf2.push(buf1[x]);
+                        }
+                        buf2.push((
+                            std::cmp::min(buf1[i].0, buf1[j].0),
+                            std::cmp::max(buf1[i].1, buf1[j].1),
+                        ));
+                        for x in i + 1..j {
+                            buf2.push(buf1[x]);
+                        }
+                        for x in j + 1..buf1.len() {
+                            buf2.push(buf1[x]);
+                        }
+                        std::mem::swap(&mut buf1, &mut buf2);
+                        buf2.clear();
+                        changes = true;
+                        break;
+                    }
+                }
+                if changes {
+                    break;
+                }
+            }
+        }
+        buf1.sort_by(|a, b| a.0.cmp(&b.0));
+        buf1
+    }
+
+    fn mask_string_check<S: AsRef<str>>(string: &str, mask: &str, keys: &[S]) -> String {
+        let spans = {
+            let mut spans = Vec::new();
+            for key in keys.iter() {
+                let mut offset = 0usize;
+                while let Some(ix) = string[offset..].find(key.as_ref()) {
+                    let len = key.as_ref().as_bytes().len();
+                    spans.push((offset + ix, offset + ix + len));
+                    offset += ix + 1;
+                }
+            }
+            spans
+        };
+
+        let unioned_spans = slow_union(&spans);
+
+        let mut offset = 0usize;
+        let mut res = Vec::new();
+        for span in unioned_spans {
+            if offset < span.0 {
+                res.extend_from_slice(&string.as_bytes()[offset..span.0]);
+            }
+            res.extend_from_slice(mask.as_bytes());
+            offset = span.1;
+        }
+        if offset < string.as_bytes().len() {
+            res.extend_from_slice(&string.as_bytes()[offset..]);
+        }
+        String::from_utf8_lossy(&res).into()
+    }
+
+    fn random_string<R: Rng>(mut rng: R, len: usize) -> String {
+        let mut res = String::new();
+        for _ in 0..len {
+            let ch = rng.gen_range('a'..'e');
+            res.push(ch);
+        }
+        res
+    }
+
+    fn random_input<R: Rng>(mut rng: R, keys: &Vec<String>, len: usize) -> String {
+        let mut res = String::new();
+        // Because we require the chunks not contain any keys, and we
+        // have a limited alphabet, making max_chunk large makes the
+        // tests run very slowly, and in some cases can essentially
+        // stall.
+        let max_chunk = std::cmp::min(5, (len / 4) + 1);
+        let mut stage = 0;
+        assert!(max_chunk > 0);
+        while res.len() < len {
+            if stage == 0 {
+                let len = rng.gen_range(1..(max_chunk + 1));
+                if len > 0 {
+                    let mut remaining = 1000;
+                    let chunk = loop {
+                        let chunk = random_string(&mut rng, len);
+                        if !keys.iter().any(|k| chunk.contains(k)) {
+                            break chunk;
+                        }
+                        remaining -= 1;
+                        if remaining == 0 {
+                            break String::new();
+                        }
+                    };
+                    res.push_str(&chunk);
+                }
+            } else if !keys.is_empty() {
+                let key = rng.gen_range(0..keys.len());
+                res.push_str(&keys[key]);
+            }
+            stage = 1 - stage;
+        }
+        res
+    }
 
     #[test]
     fn test_masker() {
@@ -397,5 +514,95 @@ mod test {
         );
         assert_eq!(m.mask_string("1a", "-MASKED-"), "1a".to_string());
         assert_eq!(m.mask_string("qqcdeblah", "-MASKED-"), "qq-MASKED-blah");
+    }
+
+    #[test]
+    fn test_masker_random() {
+        let mut rng = StdRng::seed_from_u64(0xdeadbeefabadcafe);
+        for _ in 0..2000 {
+            let num_keys = rng.gen_range(0..5);
+            let mut keys = Vec::new();
+            for _ in 0..num_keys {
+                let len = rng.gen_range(1..6);
+                keys.push(random_string(&mut rng, len));
+            }
+
+            let m = Masker::new(&keys);
+
+            for _ in 0..100 {
+                let len = rng.gen_range(0..100);
+                let input = random_input(&mut rng, &keys, len);
+                let output_as_string = m.mask_string(&input, "X");
+                let check = mask_string_check(&input, "X", &keys);
+                for key in keys.iter() {
+                    assert!(
+                        !output_as_string.contains(key),
+                        "Key {} is contained in output {}",
+                        key,
+                        output_as_string
+                    );
+                }
+                assert_eq!(output_as_string, check);
+            }
+        }
+    }
+
+    #[test]
+    fn test_chunk_masker() {
+        let m = Masker::new(&vec!["abcd", "1ab", "cde", "bce", "aa"]);
+        let mut cm = m.mask_chunks("-MASK-");
+        assert_eq!(cm.mask_chunk("ab".as_ref()).to_owned(), "".as_ref());
+        assert_eq!(cm.mask_chunk("c".as_ref()).to_owned(), "".as_ref());
+        assert_eq!(cm.mask_chunk("d".as_ref()).to_owned(), "".as_ref());
+        assert_eq!(cm.mask_chunk("g".as_ref()).to_owned(), "-MASK-g".as_ref());
+        assert_eq!(cm.finish().as_slice(), "".as_bytes())
+    }
+
+    #[test]
+    fn test_chunk_masker_random() {
+        let mut rng = StdRng::seed_from_u64(0xdeadbeefabadcafe);
+        for _ in 0..2000 {
+            let num_keys = rng.gen_range(1..=5);
+            let mut keys = Vec::new();
+            for _ in 0..num_keys {
+                let len = rng.gen_range(1..6);
+                keys.push(random_string(&mut rng, len));
+            }
+
+            let m = Masker::new(&keys);
+
+            for _ in 0..100 {
+                let len = rng.gen_range(0..100);
+                let input = random_input(&mut rng, &keys, len);
+                let mut cm = m.mask_chunks("X");
+                let mut output = Vec::new();
+                let mut offset = 0;
+                while offset < input.len() {
+                    let chunk_len = rng.gen_range(0..(std::cmp::min(10, input.len() - offset + 1)));
+                    let mut chunk = Vec::new();
+                    for _ in 0..chunk_len {
+                        chunk.push(input.as_bytes()[offset]);
+                        offset += 1;
+                    }
+                    output.extend_from_slice(cm.mask_chunk(chunk.as_ref()).as_ref());
+                }
+                output.extend(cm.finish().as_slice());
+                let output_as_string = String::from_utf8_lossy(&output);
+                let check = mask_string_check(&input, "X", &keys);
+                println!("Took input      {}", input);
+                println!("Check           {}", check);
+                println!("Keys            {:?}", keys);
+                println!("Produced output {}", String::from_utf8_lossy(&output));
+                for key in keys.iter() {
+                    assert!(
+                        !output_as_string.contains(key),
+                        "Key {} is contained in output {}",
+                        key,
+                        output_as_string
+                    );
+                }
+                assert_eq!(output_as_string, check);
+            }
+        }
     }
 }
