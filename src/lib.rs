@@ -1,9 +1,8 @@
 use core::cmp::max;
-use core::fmt::{Display, Error, Formatter};
-use std::borrow::Cow;
-use std::collections::{BTreeSet, VecDeque};
+use core::fmt::{Debug, Display, Error, Formatter};
+use std::collections::BTreeMap;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Default, Eq, PartialEq)]
 struct Match<'a> {
     input: &'a [u8],
     offset: usize,
@@ -53,36 +52,37 @@ impl<'a> Display for Match<'a> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct State<'a> {
     matches: Vec<Match<'a>>,
+    text: Vec<u8>,
+    spans: Vec<(usize, usize)>,
 }
 
 impl<'a> State<'a> {
-    fn new(matches: Vec<Match<'a>>) -> Self {
-        Self { matches }
+    fn new(matches: Vec<Match<'a>>, text: Vec<u8>, spans: Vec<(usize, usize)>) -> Self {
+        Self {
+            matches,
+            text,
+            spans,
+        }
     }
 
-    /// Return the most preceding characters that could be part of a
-    /// match if we are in this state.
-    fn longest_prefix(&self) -> Option<usize> {
-        self.matches.iter().map(Match::prefix_length).max()
-    }
-
-    fn generate_actions<S>(&self, strings: &[S]) -> Vec<u8>
+    fn generate_actions<S>(&self, strings: &[S]) -> Vec<Option<u8>>
     where
         S: AsRef<[u8]>,
     {
         let mut res = Vec::new();
         for mtch in self.matches.iter() {
             let ch = mtch.next();
-            if !res.contains(&ch) {
-                res.push(ch);
+            if !res.contains(&Some(ch)) {
+                res.push(Some(ch));
             }
         }
         for input in strings.iter() {
             let ch = input.as_ref()[0];
-            if !res.contains(&ch) {
-                res.push(ch);
+            if !res.contains(&Some(ch)) {
+                res.push(Some(ch));
             }
         }
+        res.push(None);
         res
     }
 }
@@ -102,16 +102,16 @@ struct Link {
     source: usize,
     target: usize,
     action: u8,
-    completion: Option<usize>,
+    emitted: Option<Vec<u8>>,
 }
 
 impl Link {
-    pub fn new(source: usize, target: usize, action: u8, completion: Option<usize>) -> Self {
+    pub fn new(source: usize, target: usize, action: u8, emitted: Option<Vec<u8>>) -> Self {
         Self {
             source,
             target,
             action,
-            completion,
+            emitted,
         }
     }
 }
@@ -120,12 +120,95 @@ impl Display for Link {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         write!(
             f,
-            r#"[LINK {} -> {} "{}" ({})"#,
+            "[LINK {} -> {} '{}' ({}){}",
             self.source,
             self.target,
             char::from_u32(self.action as u32).unwrap_or('?'),
-            self.action
+            self.action,
+            if let Some(emitted) = &self.emitted {
+                format!(r#" "{}""#, String::from_utf8_lossy(emitted))
+            } else {
+                String::new()
+            }
         )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LinkKey(usize);
+
+struct Links {
+    source_offset: Vec<usize>,
+    target: Vec<usize>,
+    actions: Vec<u8>,
+    emitted: Vec<Option<Vec<u8>>>,
+}
+
+impl Links {
+    pub fn new(mut links: Vec<Link>) -> Self {
+        links.sort_by(|a, b| a.source.cmp(&b.source));
+        let mut source_offset = Vec::new();
+        let mut target = Vec::new();
+        let mut actions = Vec::new();
+        let mut emitted = Vec::new();
+        let mut prev_state = 0;
+        source_offset.push(0);
+        for link in links {
+            while prev_state < link.source {
+                source_offset.push(target.len());
+                prev_state += 1;
+            }
+            target.push(link.target);
+            actions.push(link.action);
+            emitted.push(link.emitted);
+        }
+        source_offset.push(target.len());
+        Self {
+            source_offset,
+            target,
+            actions,
+            emitted,
+        }
+    }
+
+    pub fn get(&self, state: usize, action: u8) -> Option<LinkKey> {
+        let start = self.source_offset[state];
+        let end = self.source_offset[state + 1];
+        for i in start..end {
+            if self.actions[i] == action {
+                return Some(LinkKey(i));
+            }
+        }
+        None
+    }
+
+    pub fn target(&self, key: LinkKey) -> usize {
+        self.target[key.0]
+    }
+
+    pub fn emitted(&self, key: LinkKey) -> Option<&Vec<u8>> {
+        self.emitted[key.0].as_ref()
+    }
+}
+
+struct DefaultLinks {
+    emitted: Vec<Option<Vec<u8>>>,
+}
+
+impl DefaultLinks {
+    pub fn new(default_links: BTreeMap<usize, Option<Vec<u8>>>) -> Self {
+        let mut emitted = Vec::new();
+        for (k, v) in default_links {
+            if k >= emitted.len() {
+                emitted.resize(k + 1, None);
+            }
+            emitted[k] = v;
+        }
+        Self { emitted }
+    }
+
+    pub fn get(&self, state: usize) -> Option<&Vec<u8>> {
+        self.emitted[state].as_ref()
     }
 }
 
@@ -155,56 +238,145 @@ fn unify_spans(spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
     res
 }
 
+fn mask_spans<'a>(spans: &[(usize, usize)], input: &'a [u8], mask: &[u8]) -> Vec<u8> {
+    let mut res = Vec::new();
+    let mut span = 0;
+    for (i, ch) in input.iter().enumerate() {
+        if span == spans.len() || i < spans[span].0 {
+            res.push(*ch);
+        } else {
+            if i == spans[span].0 {
+                res.extend(mask.iter());
+            }
+            if i + 1 == spans[span].1 {
+                span += 1;
+            }
+        }
+    }
+    res
+}
+
 pub struct Masker {
-    prefixes: Vec<usize>,
-    links: Vec<Link>,
+    links: Links,
+    default_links: DefaultLinks,
 }
 
 impl Masker {
-    pub fn new<S>(input_strings: &[S]) -> Masker
+    pub fn new<S, T>(input_data: &[S], mask: T) -> Masker
     where
         S: AsRef<[u8]>,
+        T: AsRef<[u8]>,
     {
-        let mut states = vec![State::new(Default::default())];
-        let mut links = BTreeSet::new();
+        let mut states: Vec<State<'_>> = vec![Default::default()];
+        let mut links = Vec::new();
+        let mut default_links = BTreeMap::new();
         let mut work = vec![0usize];
 
         while let Some(index) = work.pop() {
-            let actions = states[index].generate_actions(input_strings);
+            let actions = states[index].generate_actions(input_data);
 
             for action in actions {
+                // STEP 1: Find the new matches, and spans of completed matches
                 let mut new_matches = Vec::new();
-                let mut completed = None;
+                let mut new_spans = states[index].spans.to_vec();
+                let new_text = {
+                    let mut t = states[index].text.clone();
+                    if let Some(action) = action {
+                        t.push(action);
+                    }
+                    t
+                };
 
-                for mtch in states[index].matches.iter() {
-                    if let Some(new_match) = mtch.try_next(action) {
-                        new_matches.push(new_match);
-                    } else if mtch.completed_by(action) {
-                        completed = Some(if let Some(length) = completed {
-                            max(length, mtch.len())
-                        } else {
-                            mtch.len()
-                        });
+                if let Some(action) = action {
+                    for mtch in states[index].matches.iter() {
+                        if let Some(new_match) = mtch.try_next(action) {
+                            new_matches.push(new_match);
+                        } else if mtch.completed_by(action) {
+                            new_spans.push((
+                                new_text.len() - std::cmp::min(new_text.len(), mtch.len()),
+                                new_text.len(),
+                            ))
+                        }
+                    }
+
+                    for input in input_data.iter() {
+                        let mtch = Match::new(input.as_ref(), 0);
+                        if let Some(new_match) = mtch.try_next(action) {
+                            new_matches.push(new_match)
+                        } else if mtch.completed_by(action) {
+                            new_spans.push((
+                                new_text.len() - std::cmp::min(new_text.len(), mtch.len()),
+                                new_text.len(),
+                            ))
+                        }
                     }
                 }
 
-                for input in input_strings.iter() {
-                    let mtch = Match::new(input.as_ref(), 0);
-                    if let Some(new_match) = mtch.try_next(action) {
-                        new_matches.push(new_match)
-                    } else if mtch.completed_by(action) {
-                        completed = Some(if let Some(length) = completed {
-                            max(length, mtch.len())
-                        } else {
-                            mtch.len()
-                        });
+                // STEP 2: Find the emitted text, based on the spans present
+                let unified_spans = unify_spans(&new_spans);
+                let mut emitted_spans = Vec::new();
+                let mut kept_spans = Vec::new();
+                // Keep any char that may be in the extent of a new span
+                let new_extent = new_matches
+                    .iter()
+                    .map(|m| m.prefix_length())
+                    .max()
+                    .unwrap_or(0usize);
+                let mut first_kept_char =
+                    new_text.len() - std::cmp::min(new_text.len(), new_extent);
+
+                for (x1, x2) in unified_spans {
+                    // This span does not overlap with any span we are
+                    // building
+                    if x2 + new_extent <= new_text.len() {
+                        emitted_spans.push((x1, x2));
+                    } else {
+                        kept_spans.push((x1, x2));
+                        // This span overlaps some new span, which means we
+                        // may need to keep this text too
+                        first_kept_char = std::cmp::min(first_kept_char, x1);
                     }
-                    // if input.as_ref()[0] == action {
-                    //     new_matches.push(Match::new(input.as_ref(), 1));
-                    // }
                 }
 
-                let new_state = State::new(new_matches);
+                let emitted_text = if first_kept_char > 0 {
+                    Some(mask_spans(
+                        &emitted_spans,
+                        &new_text[0..first_kept_char],
+                        mask.as_ref(),
+                    ))
+                } else {
+                    None
+                };
+
+                // Prune all emitted text
+                let new_text = &new_text[first_kept_char..];
+                // Rebase spans for pruning
+                let mut kept_spans = kept_spans
+                    .into_iter()
+                    .map(|(a, b)| (a - first_kept_char, b - first_kept_char))
+                    .collect::<Vec<_>>();
+                kept_spans.sort_by(|a: &(usize, usize), b: &(usize, usize)| a.0.cmp(&b.0));
+
+                // STEP 3: Clear any left-anchored text that will be masked,
+                //         replacing it with an empty span to mark the spot
+                let cleared = if let Some(first_span) = kept_spans.first().copied() {
+                    if first_span.0 == 0 && first_span.1 > 0 {
+                        first_span.1 - 1
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+
+                let new_text = &new_text[cleared..];
+                let kept_spans = kept_spans
+                    .into_iter()
+                    .map(|(a, b)| (a - std::cmp::min(a, cleared), b - std::cmp::min(b, cleared)))
+                    .collect::<Vec<_>>();
+
+                let new_state = State::new(new_matches, new_text.to_vec(), kept_spans);
+
                 let new_index = if let Some(new_index) = states.iter().position(|x| x == &new_state)
                 {
                     new_index
@@ -215,205 +387,98 @@ impl Masker {
                     new_index
                 };
 
-                links.insert(Link::new(index, new_index, action, completed));
+                if let Some(action) = action {
+                    let lnk = Link::new(index, new_index, action, emitted_text);
+                    links.push(lnk);
+                } else {
+                    default_links.insert(index, emitted_text);
+                }
             }
         }
 
         Self {
-            prefixes: states
-                .into_iter()
-                .map(|s| s.longest_prefix().unwrap_or(0usize))
-                .collect(),
-            links: links.into_iter().collect(),
+            links: Links::new(links),
+            default_links: DefaultLinks::new(default_links),
         }
     }
 
-    fn generate_spans<S>(&self, input: S) -> Vec<(usize, usize)>
+    pub fn mask_slice<S>(&self, input: S) -> Vec<u8>
     where
         S: AsRef<[u8]>,
     {
         let mut state = 0usize;
         let mut res = Vec::new();
-        for (i, ch) in input.as_ref().iter().enumerate() {
-            let mut matched = false;
-            for link in self.links.iter() {
-                if link.source == state && *ch == link.action {
-                    if let Some(span) = link.completion {
-                        res.push((i + 1 - span, i + 1));
-                    }
-                    state = link.target;
-                    matched = true;
-                    break;
+        res.reserve(input.as_ref().len());
+        for ch in input.as_ref().iter() {
+            if let Some(link) = self.links.get(state, *ch) {
+                if let Some(emitted) = self.links.emitted(link) {
+                    res.extend(emitted);
                 }
-            }
-            if !matched {
+                state = self.links.target(link);
+            } else {
+                if let Some(emitted) = self.default_links.get(state) {
+                    res.extend(emitted);
+                }
+                res.push(*ch);
                 state = 0;
             }
+        }
+        if let Some(emitted) = self.default_links.get(state) {
+            res.extend(emitted);
         }
         res
     }
 
-    pub fn mask_string<'a>(&self, input: &'a str, mask: &str) -> Cow<'a, str> {
-        let spans = self.generate_spans(input);
-        if spans.is_empty() {
-            return input.into();
-        }
-        let spans = unify_spans(&spans);
-        let mut res = String::new();
-        let mut span = 0;
-        for (i, ch) in input.chars().enumerate() {
-            if span == spans.len() || i < spans[span].0 {
-                res.push(ch);
-            } else {
-                if i == spans[span].0 {
-                    res.push_str(mask);
-                }
-                if i + 1 == spans[span].1 {
-                    span += 1;
-                }
-            }
-        }
-        res.into()
+    pub fn mask_str<S>(&self, input: S) -> String
+    where
+        S: AsRef<str>,
+    {
+        String::from_utf8(self.mask_slice(input.as_ref())).unwrap()
     }
 
-    pub fn mask_chunks<'a, 'b>(&'a self, mask: &'b str) -> ChunkMasker<'a, 'b> {
-        ChunkMasker::new(self, mask)
+    pub fn mask_chunks(&self) -> ChunkMasker<'_> {
+        ChunkMasker::new(self)
     }
 }
 
-pub struct ChunkMasker<'a, 'b> {
+pub struct ChunkMasker<'a> {
     owner: &'a Masker,
-    mask: &'b [u8],
     state: usize,
-    offset: usize,
-    held: VecDeque<u8>,
-    held_spans: VecDeque<(usize, usize)>,
 }
 
-impl<'a, 'b> ChunkMasker<'a, 'b> {
-    fn new(owner: &'a Masker, mask: &'b str) -> Self {
-        Self {
-            owner,
-            mask: mask.as_ref(),
-            state: 0,
-            offset: 0,
-            held: VecDeque::new(),
-            held_spans: VecDeque::new(),
-        }
+impl<'a> ChunkMasker<'a> {
+    fn new(owner: &'a Masker) -> Self {
+        Self { owner, state: 0 }
     }
 
-    fn generate_spans(&mut self, chunk: &[u8]) -> Vec<(usize, usize)> {
+    pub fn mask_chunk<C>(&mut self, chunk: C) -> Vec<u8>
+    where
+        C: AsRef<[u8]>,
+    {
         let mut res = Vec::new();
-        let start = self.offset + self.held.len();
-        for (i, ch) in chunk.as_ref().iter().enumerate() {
-            let mut matched = false;
-            for link in self.owner.links.iter() {
-                if link.source == self.state && *ch == link.action {
-                    if let Some(span) = link.completion {
-                        res.push((start + i + 1 - span, start + i + 1));
-                    }
-                    self.state = link.target;
-                    matched = true;
-                    break;
+        res.reserve(chunk.as_ref().len());
+        for ch in chunk.as_ref().iter() {
+            if let Some(link) = self.owner.links.get(self.state, *ch) {
+                if let Some(emitted) = self.owner.links.emitted(link) {
+                    res.extend(emitted);
                 }
-            }
-            if !matched {
+                self.state = self.owner.links.target(link);
+            } else {
+                if let Some(emitted) = self.owner.default_links.get(self.state) {
+                    res.extend(emitted);
+                }
+                res.push(*ch);
                 self.state = 0;
             }
         }
         res
     }
 
-    pub fn mask_chunk<'c>(&mut self, chunk: &'c [u8]) -> Cow<'c, [u8]> {
-        let spans = self.generate_spans(chunk.as_ref());
-        // (1) We don't have anything queued as possible matches
-        // (2) We haven't found anything that needs masking
-        // (3) We haven't found anything that might end up needing masking
-        if self.held.is_empty() && spans.is_empty() && self.owner.prefixes[self.state] == 0 {
-            // FIXME: this is overly conservative, we could return a slice of chunk sometimes
-            return chunk.as_ref().into();
-        }
-        // So now we have the slow path
-        self.held.extend(chunk.as_ref().iter());
-        self.held_spans.extend(spans);
-        // FIXME: we could store the unified spans
-        let spans = unify_spans(self.held_spans.make_contiguous());
-
-        //self.held now contains all the unprocessed text
-        // emittable_end is the first character that could be part of a new span
-        let emittable_end = self.held.len() - self.owner.prefixes[self.state] + self.offset;
+    pub fn finish(self) -> Vec<u8> {
         let mut res = Vec::new();
-        let mut span = 0;
-        for i in self.offset..emittable_end {
-            if span == spans.len() || i < spans[span].0 {
-                // either there is no span ahead, or we haven't reached it
-                let local_ix = i - self.offset;
-                res.push(self.held[local_ix]);
-            } else {
-                if i == spans[span].0 {
-                    // we are at the start of a span
-                    // check that it doesn't extend past emittable end
-                    if spans[span].1 > emittable_end {
-                        break;
-                    }
-                    res.extend_from_slice(self.mask);
-                }
-                if (i + 1) == spans[span].1 {
-                    // we are at the end of a span
-                    span += 1;
-                }
-            }
+        if let Some(emitted) = self.owner.default_links.get(self.state) {
+            res.extend(emitted);
         }
-
-        let end = self.offset + self.held.len();
-        let span_limit = if span < spans.len() {
-            spans[span].0
-        } else {
-            end
-        };
-        let limit = std::cmp::min(emittable_end, span_limit);
-
-        if span == spans.len() {
-            self.held_spans.clear();
-        } else {
-            while !self.held_spans.is_empty() {
-                if self.held_spans[0].1 > spans[span].0 {
-                    break;
-                }
-                self.held_spans.pop_front();
-            }
-        }
-        for _ in self.offset..limit {
-            self.held.pop_front();
-        }
-        self.offset = limit;
-
-        res.into()
-    }
-
-    pub fn finish(mut self) -> Vec<u8> {
-        if self.held.is_empty() {
-            return Vec::new();
-        }
-        // So now we have the slow path
-        let spans = unify_spans(self.held_spans.make_contiguous());
-        let mut res = Vec::new();
-        let mut span = 0;
-        let end = self.held.len() + self.offset;
-        for i in self.offset..end {
-            if span == spans.len() || i < spans[span].0 {
-                let local_ix = i - self.offset;
-                res.push(self.held[local_ix]);
-            } else {
-                if i == spans[span].0 {
-                    res.extend_from_slice(self.mask);
-                }
-                if (i + 1) == spans[span].1 {
-                    span += 1;
-                }
-            }
-        }
-
         res
     }
 }
