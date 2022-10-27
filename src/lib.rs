@@ -504,6 +504,7 @@ mod test {
     use super::Masker;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+    use std::time::Instant;
 
     fn slow_union(input: &[(usize, usize)]) -> Vec<(usize, usize)> {
         let mut buf1 = Vec::from(input);
@@ -517,18 +518,18 @@ mod test {
                     let x2 = std::cmp::min(buf1[i].1, buf1[j].1);
                     if x1 < x2 {
                         // overlap
-                        for x in 0..i {
-                            buf2.push(buf1[x]);
+                        for b in buf1.iter().take(i) {
+                            buf2.push(*b);
                         }
                         buf2.push((
                             std::cmp::min(buf1[i].0, buf1[j].0),
                             std::cmp::max(buf1[i].1, buf1[j].1),
                         ));
-                        for x in i + 1..j {
-                            buf2.push(buf1[x]);
+                        for b in buf1.iter().take(j).skip(i + 1) {
+                            buf2.push(*b);
                         }
-                        for x in j + 1..buf1.len() {
-                            buf2.push(buf1[x]);
+                        for b in buf1.iter().skip(j + 1) {
+                            buf2.push(*b);
                         }
                         std::mem::swap(&mut buf1, &mut buf2);
                         buf2.clear();
@@ -545,6 +546,25 @@ mod test {
         buf1
     }
 
+    #[test]
+    fn test_union() {
+        let mut rng = StdRng::seed_from_u64(0xdeadbeefabadcafe);
+        for _ in 0..2000000 {
+            let mut spans = Vec::new();
+            let count = rng.gen_range(1..20);
+            for _ in 0..count {
+                let x1 = rng.gen_range(0..50);
+                let x2 = x1 + rng.gen_range(1..20);
+                spans.push((x1, x2));
+            }
+            let mut value = super::unify_spans(&spans);
+            let mut check = slow_union(&spans);
+            value.sort();
+            check.sort();
+            assert_eq!(value, check);
+        }
+    }
+
     fn mask_string_check<S: AsRef<str>>(string: &str, mask: &str, keys: &[S]) -> String {
         let spans = {
             let mut spans = Vec::new();
@@ -559,7 +579,8 @@ mod test {
             spans
         };
 
-        let unioned_spans = slow_union(&spans);
+        let mut unioned_spans = super::unify_spans(&spans);
+        unioned_spans.sort();
 
         let mut offset = 0usize;
         let mut res = Vec::new();
@@ -582,6 +603,13 @@ mod test {
             let ch = rng.gen_range('a'..'e');
             res.push(ch);
         }
+        res
+    }
+
+    fn random_buffer<R: Rng>(mut rng: R, len: usize) -> Vec<u8> {
+        let mut res = Vec::new();
+        res.resize(len, 0);
+        rng.fill_bytes(res.as_mut());
         res
     }
 
@@ -622,13 +650,10 @@ mod test {
 
     #[test]
     fn test_masker() {
-        let m = Masker::new(&vec!["abcd", "1ab", "cde", "bce", "aa"]);
-        assert_eq!(
-            m.mask_string("1abcdef", "-MASKED-"),
-            "-MASKED-f".to_string()
-        );
-        assert_eq!(m.mask_string("1a", "-MASKED-"), "1a".to_string());
-        assert_eq!(m.mask_string("qqcdeblah", "-MASKED-"), "qq-MASKED-blah");
+        let m = Masker::new(&["abcd", "1ab", "cde", "bce", "aa"], "-MASKED-");
+        assert_eq!(m.mask_str("1abcdef"), "-MASKED-f".to_string());
+        assert_eq!(m.mask_str("1a"), "1a".to_string());
+        assert_eq!(m.mask_str("qqcdeblah"), "qq-MASKED-blah");
     }
 
     #[test]
@@ -642,12 +667,245 @@ mod test {
                 keys.push(random_string(&mut rng, len));
             }
 
-            let m = Masker::new(&keys);
+            let m = Masker::new(&keys, "X");
 
-            for _ in 0..100 {
+            for _ in 0..1000 {
                 let len = rng.gen_range(0..100);
                 let input = random_input(&mut rng, &keys, len);
-                let output_as_string = m.mask_string(&input, "X");
+                let output_as_string = m.mask_str(&input);
+                let check = mask_string_check(&input, "X", &keys);
+                for key in keys.iter() {
+                    assert!(
+                        !output_as_string.contains(key),
+                        "Key {} is contained in output {}",
+                        key,
+                        output_as_string
+                    );
+                }
+                assert_eq!(output_as_string, check);
+            }
+        }
+    }
+
+    fn slice_contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    fn add_separate_keys<R: Rng, S: AsRef<[u8]>>(
+        mut rng: R,
+        keys: &[S],
+        buf: &mut Vec<u8>,
+        gap: usize,
+    ) -> usize {
+        let mut offset = 0;
+        let mut keys_added = 0;
+        loop {
+            let step = rng.gen_range((gap / 2)..gap);
+            let key = &keys[rng.gen_range(0..keys.len())];
+            offset += step;
+            if offset >= buf.len() {
+                break;
+            }
+            let end = std::cmp::min(buf.len(), offset + key.as_ref().len());
+            let len = end - offset;
+            buf[offset..(len + offset)].copy_from_slice(&key.as_ref()[..len]);
+            keys_added += 1;
+            offset += len;
+        }
+        keys_added
+    }
+
+    fn add_random_keys<R: Rng, S: AsRef<[u8]>>(
+        mut rng: R,
+        keys: &[S],
+        buf: &mut Vec<u8>,
+        count: usize,
+    ) -> usize {
+        for _ in 0..count {
+            let key = &keys[rng.gen_range(0..keys.len())];
+            let offset = rng.gen_range(0..buf.len());
+            let end = std::cmp::min(buf.len(), offset + key.as_ref().len());
+            let len = end - offset;
+            buf[offset..(len + offset)].copy_from_slice(&key.as_ref()[..len]);
+        }
+        count
+    }
+
+    fn diff_buffers<A: AsRef<[u8]>, B: AsRef<[u8]>>(a: A, b: B) -> bool {
+        let len = std::cmp::min(a.as_ref().len(), b.as_ref().len());
+        let mut offset = None;
+        for i in 0..len {
+            if a.as_ref()[i] != b.as_ref()[i] {
+                offset = Some(i);
+                break;
+            }
+        }
+        if let Some(offset) = offset {
+            println!("A   B   {}", offset);
+            let start = if offset < 16 { offset } else { offset - 16 };
+            let end = if offset + 16 > len { len } else { offset + 16 };
+            for i in start..end {
+                println!("{:03} {:03}", a.as_ref()[i], b.as_ref()[i]);
+            }
+            return false;
+        } else if a.as_ref().len() > b.as_ref().len() {
+            println!("A   B   {}", b.as_ref().len());
+            for i in b.as_ref().len()..a.as_ref().len() {
+                println!("{:03} ---", a.as_ref()[i]);
+            }
+            return false;
+        } else if a.as_ref().len() < b.as_ref().len() {
+            println!("A   B   {}", a.as_ref().len());
+            for i in a.as_ref().len()..b.as_ref().len() {
+                println!("--- {:03}", b.as_ref()[i]);
+            }
+            return false;
+        }
+        true
+    }
+
+    fn mask_slice_check<S, T, U>(input: S, mask: T, keys: &[U]) -> Vec<u8>
+    where
+        S: AsRef<[u8]>,
+        T: AsRef<[u8]>,
+        U: AsRef<[u8]>,
+    {
+        let spans = {
+            let mut spans = Vec::new();
+            for key in keys.iter() {
+                for ix in input
+                    .as_ref()
+                    .windows(key.as_ref().len())
+                    .enumerate()
+                    .filter(|(_, window)| window == &key.as_ref())
+                    .map(|(index, _)| index)
+                {
+                    let len = key.as_ref().len();
+                    spans.push((ix, ix + len));
+                }
+            }
+            spans
+        };
+
+        let mut unioned_spans = super::unify_spans(&spans);
+        unioned_spans.sort();
+
+        let mut offset = 0usize;
+        let mut res = Vec::new();
+        for span in unioned_spans {
+            if offset < span.0 {
+                res.extend_from_slice(&input.as_ref()[offset..span.0]);
+            }
+            res.extend_from_slice(mask.as_ref());
+            offset = span.1;
+        }
+        if offset < input.as_ref().len() {
+            res.extend_from_slice(&input.as_ref()[offset..]);
+        }
+        res
+    }
+
+    #[test]
+    fn test_masker_slabs() {
+        let mut rng = StdRng::seed_from_u64(0xdeadbeefabadcafe);
+        for input_type in 0..4 {
+            for _ in 0..2 {
+                let num_keys = rng.gen_range(1..15);
+                let mut keys = Vec::new();
+                for _ in 0..num_keys {
+                    let len = rng.gen_range(10..50);
+                    keys.push(random_buffer(&mut rng, len));
+                }
+
+                let m = Masker::new(&keys, "XXXX-XXXX-XXXX-XXXX");
+
+                for _ in 0..3 {
+                    let len = rng.gen_range(5_000_000..100_000_000);
+                    let mut input = random_buffer(&mut rng, len);
+                    let key_count = match input_type {
+                        0 => 0,
+                        1 => add_random_keys(&mut rng, &keys, &mut input, 5),
+                        2 => add_random_keys(&mut rng, &keys, &mut input, 20),
+                        3 => add_separate_keys(&mut rng, &keys, &mut input, 20000),
+                        _ => unreachable!(),
+                    };
+                    let output_start = Instant::now();
+                    let output = m.mask_slice(&input);
+                    let output_time = Instant::now().duration_since(output_start);
+                    let check_start = Instant::now();
+                    let check = mask_slice_check(&input, "XXXX-XXXX-XXXX-XXXX", &keys);
+                    let check_time = Instant::now().duration_since(check_start);
+                    println!(
+                        "Buffer {} Keys: {} Mask time: {} Check time: {}",
+                        len,
+                        key_count,
+                        output_time.as_secs_f64(),
+                        check_time.as_secs_f64()
+                    );
+                    for key in keys.iter() {
+                        assert!(
+                            !slice_contains_slice(&output, key),
+                            "Key {:?} is contained in output",
+                            key
+                        );
+                    }
+                    for key in keys.iter() {
+                        assert!(
+                            !slice_contains_slice(&check, key),
+                            "Key {:?} is contained in check",
+                            key
+                        );
+                    }
+                    diff_buffers(&output, &check);
+                    assert_eq!(output, check);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_chunk_masker() {
+        let m = Masker::new(&["abcd", "1ab", "cde", "bce", "aa"], "-MASK-");
+        let mut cm = m.mask_chunks();
+        assert_eq!(cm.mask_chunk("ab"), Vec::new());
+        assert_eq!(cm.mask_chunk("c"), Vec::new());
+        assert_eq!(cm.mask_chunk("d"), Vec::new());
+        assert_eq!(cm.mask_chunk("g"), Vec::from("-MASK-g".as_bytes()));
+        assert_eq!(cm.finish().as_slice(), "".as_bytes())
+    }
+
+    #[test]
+    fn test_chunk_masker_random() {
+        let mut rng = StdRng::seed_from_u64(0xdeadbeefabadcafe);
+        for _ in 0..2000 {
+            let num_keys = rng.gen_range(1..=5);
+            let mut keys = Vec::new();
+            for _ in 0..num_keys {
+                let len = rng.gen_range(1..6);
+                keys.push(random_string(&mut rng, len));
+            }
+
+            let m = Masker::new(&keys, "X");
+
+            for _ in 0..1000 {
+                let len = rng.gen_range(0..100);
+                let input = random_input(&mut rng, &keys, len);
+                let mut cm = m.mask_chunks();
+                let mut output = Vec::new();
+                let mut offset = 0;
+                while offset < input.len() {
+                    let chunk_len = rng.gen_range(0..(std::cmp::min(10, input.len() - offset + 1)));
+                    let mut chunk = Vec::new();
+                    for _ in 0..chunk_len {
+                        chunk.push(input.as_bytes()[offset]);
+                        offset += 1;
+                    }
+                    output.extend_from_slice(cm.mask_chunk(chunk).as_ref());
+                }
+                output.extend(cm.finish().as_slice());
+                let output_as_string = String::from_utf8_lossy(&output);
                 let check = mask_string_check(&input, "X", &keys);
                 for key in keys.iter() {
                     assert!(
@@ -663,60 +921,67 @@ mod test {
     }
 
     #[test]
-    fn test_chunk_masker() {
-        let m = Masker::new(&vec!["abcd", "1ab", "cde", "bce", "aa"]);
-        let mut cm = m.mask_chunks("-MASK-");
-        assert_eq!(cm.mask_chunk("ab".as_ref()).to_owned(), "".as_ref());
-        assert_eq!(cm.mask_chunk("c".as_ref()).to_owned(), "".as_ref());
-        assert_eq!(cm.mask_chunk("d".as_ref()).to_owned(), "".as_ref());
-        assert_eq!(cm.mask_chunk("g".as_ref()).to_owned(), "-MASK-g".as_ref());
-        assert_eq!(cm.finish().as_slice(), "".as_bytes())
-    }
-
-    #[test]
-    fn test_chunk_masker_random() {
+    fn test_chunk_masker_slabs() {
         let mut rng = StdRng::seed_from_u64(0xdeadbeefabadcafe);
-        for _ in 0..2000 {
-            let num_keys = rng.gen_range(1..=5);
-            let mut keys = Vec::new();
-            for _ in 0..num_keys {
-                let len = rng.gen_range(1..6);
-                keys.push(random_string(&mut rng, len));
-            }
+        for input_type in 0..4 {
+            for _ in 0..2 {
+                let num_keys = rng.gen_range(1..15);
+                let mut keys = Vec::new();
+                for _ in 0..num_keys {
+                    let len = rng.gen_range(10..50);
+                    keys.push(random_buffer(&mut rng, len));
+                }
 
-            let m = Masker::new(&keys);
+                let m = Masker::new(&keys, "XXXX-XXXX-XXXX-XXXX");
 
-            for _ in 0..100 {
-                let len = rng.gen_range(0..100);
-                let input = random_input(&mut rng, &keys, len);
-                let mut cm = m.mask_chunks("X");
-                let mut output = Vec::new();
-                let mut offset = 0;
-                while offset < input.len() {
-                    let chunk_len = rng.gen_range(0..(std::cmp::min(10, input.len() - offset + 1)));
-                    let mut chunk = Vec::new();
-                    for _ in 0..chunk_len {
-                        chunk.push(input.as_bytes()[offset]);
-                        offset += 1;
+                for _ in 0..3 {
+                    let len = rng.gen_range(5_000_000..100_000_000);
+                    let mut input = random_buffer(&mut rng, len);
+                    let key_count = match input_type {
+                        0 => 0,
+                        1 => add_random_keys(&mut rng, &keys, &mut input, 5),
+                        2 => add_random_keys(&mut rng, &keys, &mut input, 20),
+                        3 => add_separate_keys(&mut rng, &keys, &mut input, 20000),
+                        _ => unreachable!(),
+                    };
+                    let output_start = Instant::now();
+                    let mut cm = m.mask_chunks();
+                    let mut output = Vec::new();
+                    let mut offset = 0;
+                    while offset < input.len() {
+                        let chunk_len =
+                            rng.gen_range(0..(std::cmp::min(10, input.len() - offset + 1)));
+                        let mut chunk = Vec::new();
+                        for _ in 0..chunk_len {
+                            chunk.push(input[offset]);
+                            offset += 1;
+                        }
+                        output.extend_from_slice(cm.mask_chunk(chunk).as_ref());
                     }
-                    output.extend_from_slice(cm.mask_chunk(chunk.as_ref()).as_ref());
-                }
-                output.extend(cm.finish().as_slice());
-                let output_as_string = String::from_utf8_lossy(&output);
-                let check = mask_string_check(&input, "X", &keys);
-                println!("Took input      {}", input);
-                println!("Check           {}", check);
-                println!("Keys            {:?}", keys);
-                println!("Produced output {}", String::from_utf8_lossy(&output));
-                for key in keys.iter() {
-                    assert!(
-                        !output_as_string.contains(key),
-                        "Key {} is contained in output {}",
-                        key,
-                        output_as_string
+                    output.extend(cm.finish().as_slice());
+                    let output_time = Instant::now().duration_since(output_start);
+
+                    let check_start = Instant::now();
+                    let check = mask_slice_check(&input, "XXXX-XXXX-XXXX-XXXX", &keys);
+                    let check_time = Instant::now().duration_since(check_start);
+                    println!(
+                        "Buffer {} Keys: {} Mask time: {} Check time: {}",
+                        len,
+                        key_count,
+                        output_time.as_secs_f64(),
+                        check_time.as_secs_f64()
                     );
+                    for key in keys.iter() {
+                        assert!(
+                            !slice_contains_slice(&output, key),
+                            "Key {:?} is contained in output {:?}",
+                            key,
+                            output
+                        );
+                    }
+                    diff_buffers(&output, &check);
+                    assert_eq!(output, check);
                 }
-                assert_eq!(output_as_string, check);
             }
         }
     }
