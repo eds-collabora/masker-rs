@@ -49,6 +49,17 @@ impl<'a> Display for Match<'a> {
     }
 }
 
+impl<'a> Debug for Match<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        write!(
+            f,
+            "[MATCH '{}' {}]",
+            String::from_utf8_lossy(self.input),
+            self.offset
+        )
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct State<'a> {
     matches: Vec<Match<'a>>,
@@ -89,7 +100,12 @@ impl<'a> State<'a> {
 
 impl<'a> std::fmt::Display for State<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-        write!(f, "[STATE")?;
+        write!(
+            f,
+            "[STATE '{}' {:?}",
+            String::from_utf8_lossy(&self.text),
+            self.spans
+        )?;
         for s in self.matches.iter() {
             write!(f, " {}", s)?;
         }
