@@ -1,3 +1,16 @@
+//! # masker
+//!
+//! This crate provides an object [`Masker`] which can replace
+//! a set of (potentially overlapping) patterns in input data
+//! with a fixed mask. It's usually faster than simply doing
+//! searches with replacement one by one, and it handles two
+//! awkward cases:
+//! - It allows you to provide the data in chunks, for example
+//!   to mask data as you upload it.
+//! - It handles the case where masked regions blend together, for
+//!   example if two patterns are present and overlap, then replacing
+//!   either of them first leaves characters from the other visible.
+
 use core::cmp::max;
 use core::fmt::{Debug, Display, Error, Formatter};
 use std::collections::BTreeMap;
@@ -272,12 +285,53 @@ fn mask_spans<'a>(spans: &[(usize, usize)], input: &'a [u8], mask: &[u8]) -> Vec
     res
 }
 
+/// Replace byte sequences with a chosen mask value
+///
+/// This is the central object of this crate. When creating one, an
+/// FSM is constructed that can run over a block of data, byte by
+/// byte, and replace a set of pre-selected patterns by a mask
+/// pattern.
+///
+/// You can provide all the data up front, using
+/// [`mask_slice`](Masker::mask_slice) and
+/// [`mask_str`](Masker::mask_str), or you can opt to stream your data
+/// through it using [`mask_chunks`](Masker::mask_chunks).
+///
+/// Example:
+/// ```rust
+/// use masker::Masker;
+///
+/// let m = Masker::new(&["frog", "cat"], "XXXX");
+/// let s = m.mask_str("the bad frog sat on the cat");
+/// assert_eq!(s.as_str(), "the bad XXXX sat on the XXXX");
+/// ```
 pub struct Masker {
     links: Links,
     default_links: DefaultLinks,
 }
 
 impl Masker {
+    /// Create a new masker
+    ///
+    /// `input_data` are the things you want to mask in any data
+    /// that is given to the masker. `mask` is the replacement you
+    /// want instead of those input data.
+    ///
+    /// This builds a finite state machine capable of processing
+    /// the given input data and mask, and has non-negligible cost,
+    /// similiar to a regex compilation.
+    ///
+    /// Note that it is permissible for the input data to have overlaps,
+    /// e.g. the case where you mask "cater" and "bobcat" is handled.
+    ///
+    /// Example:
+    /// ```rust
+    /// use masker::Masker;
+    ///
+    /// let m = Masker::new(&["cater", "bobcat"], "XXXX");
+    /// let s = m.mask_str("what does bobcater do?");
+    /// assert_eq!(s.as_str(), "what does XXXX do?");
+    /// ```
     pub fn new<S, T>(input_data: &[S], mask: T) -> Masker
     where
         S: AsRef<[u8]>,
@@ -418,6 +472,19 @@ impl Masker {
         }
     }
 
+    /// Apply masking to a slice of data
+    ///
+    /// All patterns and overlaps found within the given data block
+    /// will be replaced with the previously chosen mask value.
+    ///
+    /// Example
+    /// ```rust
+    /// use masker::Masker;
+    ///
+    /// let m = Masker::new(&["frog", "cat"], "XXXX");
+    /// let v = m.mask_slice("the bad frog sat on the cat".as_bytes());
+    /// assert_eq!(v.as_slice(), "the bad XXXX sat on the XXXX".as_bytes());
+    /// ```
     pub fn mask_slice<S>(&self, input: S) -> Vec<u8>
     where
         S: AsRef<[u8]>,
@@ -445,6 +512,13 @@ impl Masker {
         res
     }
 
+    /// Apply masking to text
+    ///
+    /// All patterns and overlaps found within the given data block
+    /// will be replace with the previously chosen mask value.
+    ///
+    /// This is simply a convenience wrapper over
+    /// [`mask_slice`](Masker::mask_slice).
     pub fn mask_str<S>(&self, input: S) -> String
     where
         S: AsRef<str>,
@@ -452,11 +526,39 @@ impl Masker {
         String::from_utf8(self.mask_slice(input.as_ref())).unwrap()
     }
 
+    /// Begin masking a stream of data chunks
+    ///
+    /// The return value is an object that will handle the sequence.
+    /// It has to be this way because we need to cope with masking
+    /// over chunk boundaries, and for that reason there can be some
+    /// limited buffering introduced here.
+    ///
+    /// Example:
+    /// ```rust
+    /// use masker::Masker;
+    ///
+    /// let m = Masker::new(&["frog", "cat"], "XXXX");
+    /// let mut cm = m.mask_chunks();
+    /// let mut v = Vec::new();
+    /// v.extend(cm.mask_chunk("the ba"));
+    /// v.extend(cm.mask_chunk("d f"));
+    /// v.extend(cm.mask_chunk("rog sat on the c"));
+    /// v.extend(cm.mask_chunk("at"));
+    /// v.extend(cm.finish());
+    ///
+    /// assert_eq!(v.as_slice(), "the bad XXXX sat on the XXXX".as_bytes());
+    /// ```
     pub fn mask_chunks(&self) -> ChunkMasker<'_> {
         ChunkMasker::new(self)
     }
 }
 
+/// Mask a sequence of data blocks
+///
+/// This is the return value from [`Masker::mask_chunks`] and cannot
+/// be constructed directly. It expects data to be fed into it
+/// sequentially and will correctly mask patterns that cross chunk
+/// boundaries.
 pub struct ChunkMasker<'a> {
     owner: &'a Masker,
     state: usize,
@@ -467,6 +569,13 @@ impl<'a> ChunkMasker<'a> {
         Self { owner, state: 0 }
     }
 
+    /// Process the next block of data
+    ///
+    /// Not all the output from this block will necessarily be
+    /// produced as a result of this call; some buffering will be
+    /// required if there is a possible match that extends past the
+    /// end of the chunk.  Similarly, some output may be produced from
+    /// previous chunks, if buffering was introduced there.
     pub fn mask_chunk<C>(&mut self, chunk: C) -> Vec<u8>
     where
         C: AsRef<[u8]>,
@@ -490,6 +599,11 @@ impl<'a> ChunkMasker<'a> {
         res
     }
 
+    /// Finish streaming and flush buffers
+    ///
+    /// This indicates that there is no further data to come, so any
+    /// potential partial matches that have led to buffering can be
+    /// resolved, and output produced for them.
     pub fn finish(self) -> Vec<u8> {
         let mut res = Vec::new();
         if let Some(emitted) = self.owner.default_links.get(self.state) {
