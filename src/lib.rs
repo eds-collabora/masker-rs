@@ -166,6 +166,7 @@ impl Display for Link {
 #[derive(Debug, Clone, Copy)]
 struct LinkKey(usize);
 
+#[derive(Clone, Debug)]
 struct Links {
     source_offset: Vec<usize>,
     target: Vec<usize>,
@@ -220,6 +221,7 @@ impl Links {
     }
 }
 
+#[derive(Clone, Debug)]
 struct DefaultLinks {
     emitted: Vec<Option<Vec<u8>>>,
 }
@@ -305,6 +307,7 @@ fn mask_spans<'a>(spans: &[(usize, usize)], input: &'a [u8], mask: &[u8]) -> Vec
 /// let s = m.mask_str("the bad frog sat on the cat");
 /// assert_eq!(s.as_str(), "the bad XXXX sat on the XXXX");
 /// ```
+#[derive(Clone, Debug)]
 pub struct Masker {
     links: Links,
     default_links: DefaultLinks,
