@@ -848,10 +848,9 @@ impl<'a> ChunkMasker<'a> {
 
 #[cfg(test)]
 mod test {
-    use super::Masker;
+    use super::{Masker, MatchData};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
-    use std::time::Instant;
 
     fn slow_union(input: &[(usize, usize)]) -> Vec<(usize, usize)> {
         let mut buf1 = Vec::from(input);
@@ -956,6 +955,9 @@ mod test {
     fn random_buffer<R: Rng>(mut rng: R, len: usize) -> Vec<u8> {
         let mut res = Vec::new();
         res.resize(len, 0);
+        for ch in res.iter_mut() {
+            *ch = rng.gen_range(0x61..0x7a);
+        }
         rng.fill_bytes(res.as_mut());
         res
     }
@@ -1080,6 +1082,7 @@ mod test {
         count
     }
 
+    #[allow(dead_code)]
     fn diff_buffers<A: AsRef<[u8]>, B: AsRef<[u8]>>(a: A, b: B) -> bool {
         let len = std::cmp::min(a.as_ref().len(), b.as_ref().len());
         let mut offset = None;
@@ -1091,10 +1094,19 @@ mod test {
         }
         if let Some(offset) = offset {
             println!("A   B   {}", offset);
-            let start = if offset < 16 { offset } else { offset - 16 };
-            let end = if offset + 16 > len { len } else { offset + 16 };
+            let start = if offset < 100 { 0 } else { offset - 100 };
+            let end = if offset + 100 > len {
+                len
+            } else {
+                offset + 100
+            };
             for i in start..end {
-                println!("{:03} {:03}", a.as_ref()[i], b.as_ref()[i]);
+                println!(
+                    "{:03} {:03}{}",
+                    a.as_ref()[i],
+                    b.as_ref()[i],
+                    if i == offset { " *" } else { "" }
+                );
             }
             return false;
         } else if a.as_ref().len() > b.as_ref().len() {
@@ -1171,26 +1183,15 @@ mod test {
                 for _ in 0..3 {
                     let len = rng.gen_range(5_000_000..100_000_000);
                     let mut input = random_buffer(&mut rng, len);
-                    let key_count = match input_type {
+                    match input_type {
                         0 => 0,
                         1 => add_random_keys(&mut rng, &keys, &mut input, 5),
                         2 => add_random_keys(&mut rng, &keys, &mut input, 20),
                         3 => add_separate_keys(&mut rng, &keys, &mut input, 20000),
                         _ => unreachable!(),
                     };
-                    let output_start = Instant::now();
                     let output = m.mask_slice(&input);
-                    let output_time = Instant::now().duration_since(output_start);
-                    let check_start = Instant::now();
                     let check = mask_slice_check(&input, "XXXX-XXXX-XXXX-XXXX", &keys);
-                    let check_time = Instant::now().duration_since(check_start);
-                    println!(
-                        "Buffer {} Keys: {} Mask time: {} Check time: {}",
-                        len,
-                        key_count,
-                        output_time.as_secs_f64(),
-                        check_time.as_secs_f64()
-                    );
                     for key in keys.iter() {
                         assert!(
                             !slice_contains_slice(&output, key),
@@ -1213,7 +1214,7 @@ mod test {
     }
 
     #[test]
-    fn test_chunk_masker() {
+    fn test_chunk_masker_sanity() {
         let m = Masker::new(&["abcd", "1ab", "cde", "bce", "aa"], "-MASK-");
         let mut cm = m.mask_chunks();
         assert_eq!(cm.mask_chunk("ab"), Vec::new());
@@ -1224,7 +1225,7 @@ mod test {
     }
 
     #[test]
-    fn test_chunk_masker_random() {
+    fn test_chunk_masker_random_no_prefixes() {
         let mut rng = StdRng::seed_from_u64(0xdeadbeefabadcafe);
         for _ in 0..2000 {
             let num_keys = rng.gen_range(1..=5);
@@ -1284,14 +1285,13 @@ mod test {
                 for _ in 0..3 {
                     let len = rng.gen_range(5_000_000..100_000_000);
                     let mut input = random_buffer(&mut rng, len);
-                    let key_count = match input_type {
+                    match input_type {
                         0 => 0,
                         1 => add_random_keys(&mut rng, &keys, &mut input, 5),
                         2 => add_random_keys(&mut rng, &keys, &mut input, 20),
                         3 => add_separate_keys(&mut rng, &keys, &mut input, 20000),
                         _ => unreachable!(),
                     };
-                    let output_start = Instant::now();
                     let mut cm = m.mask_chunks();
                     let mut output = Vec::new();
                     let mut offset = 0;
@@ -1306,17 +1306,644 @@ mod test {
                         output.extend_from_slice(cm.mask_chunk(chunk).as_ref());
                     }
                     output.extend(cm.finish().as_slice());
-                    let output_time = Instant::now().duration_since(output_start);
 
-                    let check_start = Instant::now();
                     let check = mask_slice_check(&input, "XXXX-XXXX-XXXX-XXXX", &keys);
-                    let check_time = Instant::now().duration_since(check_start);
-                    println!(
-                        "Buffer {} Keys: {} Mask time: {} Check time: {}",
-                        len,
-                        key_count,
-                        output_time.as_secs_f64(),
-                        check_time.as_secs_f64()
+                    for key in keys.iter() {
+                        assert!(
+                            !slice_contains_slice(&output, key),
+                            "Key {:?} is contained in output {:?}",
+                            key,
+                            output
+                        );
+                    }
+                    diff_buffers(&output, &check);
+                    assert_eq!(output, check);
+                }
+            }
+        }
+    }
+
+    fn mask_string_check_with_prefixes<S: AsRef<str>>(
+        string: &str,
+        mask: &str,
+        keys: &[S],
+        pfxes: &[MatchData],
+    ) -> String {
+        let key_spans = {
+            let mut spans = Vec::new();
+            for key in keys.iter() {
+                let mut offset = 0usize;
+                while let Some(ix) = string[offset..].find(key.as_ref()) {
+                    let len = key.as_ref().as_bytes().len();
+                    spans.push((offset + ix, offset + ix + len));
+                    offset += ix + 1;
+                }
+            }
+            spans
+        };
+
+        let pfx_spans = {
+            let mut spans = Vec::new();
+            for pfx in pfxes.iter() {
+                if !pfx.prefix.is_empty() {
+                    let mut offset = 0usize;
+                    while let Some(ix) =
+                        string[offset..].find(String::from_utf8_lossy(pfx.prefix).as_ref())
+                    {
+                        let start_ix = if pfx.mask_prefix {
+                            offset + ix
+                        } else {
+                            offset + ix + pfx.prefix.len()
+                        };
+                        let mut end_ix = offset + ix + pfx.prefix.len();
+                        while end_ix < string.len()
+                            && pfx.suffix.contains(&string.as_bytes()[end_ix])
+                        {
+                            end_ix += 1;
+                        }
+                        if end_ix > start_ix {
+                            spans.push((start_ix, end_ix));
+                        }
+                        offset += ix + 1;
+                        if offset >= string.as_bytes().len() {
+                            break;
+                        }
+                    }
+                }
+            }
+            spans
+        };
+
+        let mut spans = key_spans;
+        spans.extend(pfx_spans);
+
+        let mut unioned_spans = super::unify_spans(&spans);
+        unioned_spans.sort();
+
+        let mut offset = 0usize;
+        let mut res = Vec::new();
+        for span in unioned_spans {
+            if offset < span.0 {
+                res.extend_from_slice(&string.as_bytes()[offset..span.0]);
+            }
+            res.extend_from_slice(mask.as_bytes());
+            offset = span.1;
+        }
+        if offset < string.as_bytes().len() {
+            res.extend_from_slice(&string.as_bytes()[offset..]);
+        }
+
+        for pfx in pfxes.iter() {
+            if pfx.prefix.is_empty() {
+                let mut buf = Vec::new();
+                for b in res.iter() {
+                    if pfx.suffix.contains(b) {
+                        buf.extend_from_slice(mask.as_bytes());
+                    } else {
+                        buf.push(*b);
+                    }
+                }
+                std::mem::swap(&mut res, &mut buf);
+            }
+        }
+
+        String::from_utf8_lossy(&res).into()
+    }
+
+    fn add_separate_keys_with_prefixes<R: Rng, S: AsRef<[u8]>>(
+        mut rng: R,
+        keys: &[S],
+        pfxes: &[MatchData],
+        buf: &mut Vec<u8>,
+        gap: usize,
+    ) -> usize {
+        let mut offset = 0;
+        let mut keys_added = 0;
+        loop {
+            let step = rng.gen_range((gap / 2)..gap);
+            let key_ix = rng.gen_range(0..keys.len() + pfxes.len());
+            offset += step;
+            if offset >= buf.len() {
+                break;
+            }
+            if key_ix < keys.len() {
+                let key = &keys[key_ix];
+                let end = std::cmp::min(buf.len(), offset + key.as_ref().len());
+                let len = end - offset;
+                buf[offset..(len + offset)].copy_from_slice(&key.as_ref()[..len]);
+                offset += len;
+            } else {
+                let pfx = &pfxes[key_ix - keys.len()];
+                let pfx_end = std::cmp::min(buf.len(), offset + pfx.prefix.len());
+                let pfx_len = pfx_end - offset;
+                buf[offset..(pfx_len + offset)].copy_from_slice(&pfx.prefix[..pfx_len]);
+                offset += pfx_len;
+                let suffix_len = if !pfx.suffix.is_empty() && offset < buf.len() {
+                    rng.gen_range(0..std::cmp::min(64, buf.len() - offset))
+                } else {
+                    0
+                };
+                for _ in 0..suffix_len {
+                    buf[offset] = pfx.suffix[rng.gen_range(0..pfx.suffix.len())];
+                    offset += 1;
+                }
+            }
+            keys_added += 1;
+        }
+        keys_added
+    }
+
+    fn add_random_keys_with_prefixes<R: Rng, S: AsRef<[u8]>>(
+        mut rng: R,
+        keys: &[S],
+        pfxes: &[MatchData],
+        buf: &mut Vec<u8>,
+        count: usize,
+    ) -> usize {
+        for _ in 0..count {
+            let ix = rng.gen_range(0..(keys.len() + pfxes.len()));
+            let offset = rng.gen_range(0..buf.len());
+            if ix < keys.len() {
+                let key = &keys[ix];
+                let end = std::cmp::min(buf.len(), offset + key.as_ref().len());
+                let len = end - offset;
+                buf[offset..(len + offset)].copy_from_slice(&key.as_ref()[..len]);
+            } else {
+                let pfx = &pfxes[ix - keys.len()];
+                let pfx_end = std::cmp::min(buf.len(), offset + pfx.prefix.len());
+                let pfx_len = pfx_end - offset;
+                buf[offset..(pfx_len + offset)].copy_from_slice(&pfx.prefix[..pfx_len]);
+                let suffix_len = if !pfx.suffix.is_empty() && offset < buf.len() {
+                    rng.gen_range(0..std::cmp::min(64, buf.len() - offset))
+                } else {
+                    0
+                };
+                for i in 0..suffix_len {
+                    buf[offset + pfx_len + i] = pfx.suffix[rng.gen_range(0..pfx.suffix.len())];
+                }
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn test_masker_with_prefixes() {
+        let p = MatchData {
+            prefix: "pfx-".as_ref(),
+            suffix: "abcde".as_ref(),
+            mask_prefix: false,
+        };
+        let inputs: &[&str] = &[];
+        let m = Masker::new_with_match_data(inputs, &[p], "-MASKED-");
+        assert_eq!(
+            m.mask_str("pfx-aeebfcsfasgs"),
+            "pfx--MASKED-fcsfasgs".to_string()
+        );
+
+        let p = MatchData {
+            prefix: "pfx-".as_ref(),
+            suffix: "abcde".as_ref(),
+            mask_prefix: true,
+        };
+        let inputs: &[&str] = &[];
+        let m = Masker::new_with_match_data(inputs, &[p], "-MASKED-");
+        assert_eq!(
+            m.mask_str("pfx-aeebfcsfasgs"),
+            "-MASKED-fcsfasgs".to_string()
+        );
+    }
+
+    #[test]
+    fn test_masker_with_prefixes_random() {
+        let mut rng = StdRng::seed_from_u64(0xdeadbeefabadcafe);
+        for _ in 0..2000 {
+            let num_keys = rng.gen_range(0..5);
+            let mut keys = Vec::new();
+            for _ in 0..num_keys {
+                let len = rng.gen_range(1..6);
+                keys.push(random_string(&mut rng, len));
+            }
+            let num_prefixes = rng.gen_range(0..3);
+            let mut prefixes = Vec::new();
+            let mut suffixes = Vec::new();
+            for _ in 0..num_prefixes {
+                let prefix_len = rng.gen_range(0..6);
+                let pfx = random_string(&mut rng, prefix_len);
+                let suffix_set = rng.gen_range(0..4);
+                let suf = {
+                    let mut s = String::new();
+                    while s.len() < suffix_set {
+                        let ch = rng.gen_range('a'..'e');
+                        if !s.contains(ch) {
+                            s.push(ch);
+                        }
+                    }
+                    s
+                };
+                prefixes.push(pfx);
+                suffixes.push(suf);
+            }
+            let mask_prefix = rng.gen_bool(0.5);
+
+            let mut pfxes = Vec::new();
+            for i in 0..num_prefixes {
+                pfxes.push(MatchData {
+                    prefix: prefixes[i].as_ref(),
+                    suffix: suffixes[i].as_ref(),
+                    mask_prefix,
+                });
+            }
+
+            let m = Masker::new_with_match_data(&keys, &pfxes, "X");
+
+            for _ in 0..1000 {
+                let len = rng.gen_range(0..100);
+                let input = random_input(&mut rng, &keys, len);
+                let output_as_string = m.mask_str(&input);
+                let check = mask_string_check_with_prefixes(&input, "X", &keys, &pfxes);
+                for key in keys.iter() {
+                    assert!(
+                        !output_as_string.contains(key),
+                        "Key {} is contained in output {}",
+                        key,
+                        output_as_string
+                    );
+                }
+                for pfx in pfxes.iter() {
+                    if !pfx.prefix.is_empty() {
+                        if pfx.mask_prefix {
+                            assert!(
+                                !output_as_string.contains(&*String::from_utf8_lossy(pfx.prefix)),
+                                "Prefix {} is contained in output {}",
+                                String::from_utf8_lossy(pfx.prefix),
+                                output_as_string
+                            );
+                        } else {
+                            for ix in output_as_string
+                                .as_bytes()
+                                .windows(pfx.prefix.len())
+                                .enumerate()
+                                .filter(|(_, w)| w == &pfx.prefix)
+                                .map(|(ix, _)| ix)
+                            {
+                                if ix + pfx.prefix.len() == output_as_string.as_bytes().len() {
+                                    break;
+                                }
+                                assert!(
+                                    !pfx.suffix.contains(
+                                        &output_as_string.as_bytes()[ix + pfx.prefix.len()]
+                                    ),
+                                    "Suffix char {} is present after prefix {} at offset {} in {}",
+                                    char::from_u32(
+                                        output_as_string.as_bytes()[ix + pfx.prefix.len()] as u32
+                                    )
+                                    .unwrap(),
+                                    String::from_utf8_lossy(pfx.prefix),
+                                    ix,
+                                    output_as_string
+                                );
+                            }
+                        }
+                    } else {
+                        for ch in pfx.suffix.iter() {
+                            assert!(
+                                !output_as_string.as_bytes().contains(ch),
+                                "Suffix char {} of suffix {} is contained in output",
+                                ch,
+                                String::from_utf8_lossy(pfx.suffix)
+                            );
+                        }
+                    }
+                }
+
+                assert_eq!(output_as_string, check);
+            }
+        }
+    }
+
+    #[test]
+    fn test_chunk_masker_with_prefixes() {
+        let p = MatchData {
+            prefix: "pfx-".as_ref(),
+            suffix: "abcde".as_ref(),
+            mask_prefix: false,
+        };
+        let inputs: &[&str] = &[];
+        let m = Masker::new_with_match_data(inputs, &[p], "-MASKED-");
+        let mut cm = m.mask_chunks();
+        assert_eq!(cm.mask_chunk("pf"), Vec::from("pf".as_bytes()));
+        assert_eq!(cm.mask_chunk("x-a"), Vec::from("x-".as_bytes()));
+        assert_eq!(cm.mask_chunk("eebfcs"), Vec::from("-MASKED-fcs"));
+        assert_eq!(cm.mask_chunk("fasgs"), Vec::from("fasgs".as_bytes()));
+        assert_eq!(cm.finish().as_slice(), "".as_bytes());
+
+        let p = MatchData {
+            prefix: "pfx-".as_ref(),
+            suffix: "abcde".as_ref(),
+            mask_prefix: true,
+        };
+        let inputs: &[&str] = &[];
+        let m = Masker::new_with_match_data(inputs, &[p], "-MASKED-");
+        let mut cm = m.mask_chunks();
+        assert_eq!(cm.mask_chunk("pf"), Vec::new());
+        assert_eq!(cm.mask_chunk("x-a"), Vec::new());
+        assert_eq!(cm.mask_chunk("eebfcs"), Vec::from("-MASKED-fcs"));
+        assert_eq!(cm.mask_chunk("fasgs"), Vec::from("fasgs".as_bytes()));
+        assert_eq!(cm.finish().as_slice(), "".as_bytes());
+    }
+
+    #[test]
+    fn test_chunk_masker_random_with_prefixes() {
+        let mut rng = StdRng::seed_from_u64(0xdeadbeefabadcafe);
+        for _ in 0..2000 {
+            let num_keys = rng.gen_range(1..=5);
+            let mut keys = Vec::new();
+            for _ in 0..num_keys {
+                let len = rng.gen_range(1..6);
+                keys.push(random_string(&mut rng, len));
+            }
+            let num_prefixes = rng.gen_range(0..3);
+            let mut prefixes = Vec::new();
+            let mut suffixes = Vec::new();
+            for _ in 0..num_prefixes {
+                let prefix_len = rng.gen_range(0..6);
+                let pfx = random_string(&mut rng, prefix_len);
+                let suffix_set = rng.gen_range(0..4);
+                let suf = {
+                    let mut s = String::new();
+                    while s.len() < suffix_set {
+                        let ch = rng.gen_range('a'..'e');
+                        if !s.contains(ch) {
+                            s.push(ch);
+                        }
+                    }
+                    s
+                };
+                prefixes.push(pfx);
+                suffixes.push(suf);
+            }
+            let mask_prefix = rng.gen_bool(0.5);
+
+            let mut pfxes = Vec::new();
+            for i in 0..num_prefixes {
+                pfxes.push(MatchData {
+                    prefix: prefixes[i].as_ref(),
+                    suffix: suffixes[i].as_ref(),
+                    mask_prefix,
+                });
+            }
+
+            let m = Masker::new_with_match_data(&keys, &pfxes, "X");
+
+            for _ in 0..1000 {
+                let len = rng.gen_range(0..100);
+                let input = random_input(&mut rng, &keys, len);
+                let mut cm = m.mask_chunks();
+                let mut output = Vec::new();
+                let mut offset = 0;
+                while offset < input.len() {
+                    let chunk_len = rng.gen_range(0..(std::cmp::min(10, input.len() - offset + 1)));
+                    let mut chunk = Vec::new();
+                    for _ in 0..chunk_len {
+                        chunk.push(input.as_bytes()[offset]);
+                        offset += 1;
+                    }
+                    output.extend_from_slice(cm.mask_chunk(chunk).as_ref());
+                }
+                output.extend(cm.finish().as_slice());
+                let output_as_string = String::from_utf8_lossy(&output);
+                let check = mask_string_check_with_prefixes(&input, "X", &keys, &pfxes);
+                for key in keys.iter() {
+                    assert!(
+                        !output_as_string.contains(key),
+                        "Key {} is contained in output {}",
+                        key,
+                        output_as_string
+                    );
+                }
+                for pfx in pfxes.iter() {
+                    if !pfx.prefix.is_empty() {
+                        if pfx.mask_prefix {
+                            assert!(
+                                !output_as_string.contains(&*String::from_utf8_lossy(pfx.prefix)),
+                                "Prefix {} is contained in output {}",
+                                String::from_utf8_lossy(pfx.prefix),
+                                output_as_string
+                            );
+                        } else {
+                            for ix in output_as_string
+                                .as_bytes()
+                                .windows(pfx.prefix.len())
+                                .enumerate()
+                                .filter(|(_, w)| w == &pfx.prefix)
+                                .map(|(ix, _)| ix)
+                            {
+                                if ix + pfx.prefix.len() == output_as_string.as_bytes().len() {
+                                    break;
+                                }
+                                assert!(
+                                    !pfx.suffix.contains(
+                                        &output_as_string.as_bytes()[ix + pfx.prefix.len()]
+                                    ),
+                                    "Suffix char {} is present after prefix {} at offset {} in {}",
+                                    char::from_u32(
+                                        output_as_string.as_bytes()[ix + pfx.prefix.len()] as u32
+                                    )
+                                    .unwrap(),
+                                    String::from_utf8_lossy(pfx.prefix),
+                                    ix,
+                                    output_as_string
+                                );
+                            }
+                        }
+                    } else {
+                        for ch in pfx.suffix.iter() {
+                            assert!(
+                                !output_as_string.as_bytes().contains(ch),
+                                "Suffix char {} of suffix {} is contained in output",
+                                ch,
+                                String::from_utf8_lossy(pfx.suffix)
+                            );
+                        }
+                    }
+                }
+
+                assert_eq!(output_as_string, check);
+            }
+        }
+    }
+
+    fn mask_slice_check_with_prefixes<S, T, U>(
+        input: S,
+        mask: T,
+        keys: &[U],
+        pfxes: &[MatchData],
+    ) -> Vec<u8>
+    where
+        S: AsRef<[u8]>,
+        T: AsRef<[u8]>,
+        U: AsRef<[u8]>,
+    {
+        let key_spans = {
+            let mut spans = Vec::new();
+            for key in keys.iter() {
+                for ix in input
+                    .as_ref()
+                    .windows(key.as_ref().len())
+                    .enumerate()
+                    .filter(|(_, window)| window == &key.as_ref())
+                    .map(|(index, _)| index)
+                {
+                    let len = key.as_ref().len();
+                    spans.push((ix, ix + len));
+                }
+            }
+            spans
+        };
+
+        let pfx_spans = {
+            let mut spans = Vec::new();
+            for pfx in pfxes.iter() {
+                if !pfx.prefix.is_empty() {
+                    for ix in input
+                        .as_ref()
+                        .windows(pfx.prefix.len())
+                        .enumerate()
+                        .filter(|(_, window)| window == &pfx.prefix)
+                        .map(|(index, _)| index)
+                    {
+                        let len = pfx.prefix.len();
+                        let end_ix = ix
+                            + input.as_ref()[ix + len..]
+                                .iter()
+                                .position(|ch| !pfx.suffix.contains(ch))
+                                .map(|i| len + i)
+                                .unwrap_or_else(|| input.as_ref().len() - ix);
+                        if pfx.mask_prefix {
+                            spans.push((ix, end_ix));
+                        } else if end_ix > ix + len {
+                            spans.push((ix + len, end_ix));
+                        }
+                    }
+                }
+            }
+            spans
+        };
+
+        let mut spans = key_spans;
+        spans.extend(pfx_spans);
+
+        let mut unioned_spans = super::unify_spans(&spans);
+        unioned_spans.sort();
+
+        let mut offset = 0usize;
+        let mut res = Vec::new();
+        for span in unioned_spans {
+            if offset < span.0 {
+                res.extend_from_slice(&input.as_ref()[offset..span.0]);
+            }
+            res.extend_from_slice(mask.as_ref());
+            offset = span.1;
+        }
+        if offset < input.as_ref().len() {
+            res.extend_from_slice(&input.as_ref()[offset..]);
+        }
+
+        for pfx in pfxes.iter() {
+            if pfx.prefix.is_empty() {
+                let mut buf = Vec::new();
+                for b in res.iter() {
+                    if pfx.suffix.contains(b) {
+                        buf.extend_from_slice(mask.as_ref());
+                    } else {
+                        buf.push(*b);
+                    }
+                }
+                std::mem::swap(&mut res, &mut buf);
+            }
+        }
+
+        res
+    }
+
+    #[test]
+    fn test_chunk_masker_slabs_with_prefixes() {
+        let mut rng = StdRng::seed_from_u64(0xdeadbeefabadcafe);
+        for input_type in 0..4 {
+            for _ in 0..2 {
+                let num_keys = rng.gen_range(1..15);
+                let mut keys = Vec::new();
+                for _ in 0..num_keys {
+                    let len = rng.gen_range(10..50);
+                    keys.push(random_buffer(&mut rng, len));
+                }
+
+                let num_prefixes = rng.gen_range(0..10);
+                let mut prefixes = Vec::new();
+                let mut suffixes = Vec::new();
+                for _ in 0..num_prefixes {
+                    let prefix_len = rng.gen_range(0..15);
+                    let pfx = random_buffer(&mut rng, prefix_len);
+                    let suffix_set = rng.gen_range(0..50);
+                    let suf = {
+                        let mut s = Vec::new();
+                        while s.len() < suffix_set {
+                            let ch = rng.gen_range(0..50);
+                            if !s.contains(&ch) {
+                                s.push(ch);
+                            }
+                        }
+                        s.sort();
+                        s
+                    };
+                    prefixes.push(pfx);
+                    suffixes.push(suf);
+                }
+                let mask_prefix = rng.gen_bool(0.5);
+
+                let mut pfxes = Vec::new();
+                for i in 0..num_prefixes {
+                    pfxes.push(MatchData {
+                        prefix: prefixes[i].as_ref(),
+                        suffix: suffixes[i].as_ref(),
+                        mask_prefix,
+                    });
+                }
+
+                let m = Masker::new_with_match_data(&keys, &pfxes, "ABCD=EFGH=IJKL=MNOP");
+
+                for _ in 0..3 {
+                    let len = rng.gen_range(5_000_000..100_000_000);
+                    let mut input = random_buffer(&mut rng, len);
+                    match input_type {
+                        0 => 0,
+                        1 => add_random_keys_with_prefixes(&mut rng, &keys, &pfxes, &mut input, 5),
+                        2 => add_random_keys_with_prefixes(&mut rng, &keys, &pfxes, &mut input, 20),
+                        3 => add_separate_keys_with_prefixes(
+                            &mut rng, &keys, &pfxes, &mut input, 20000,
+                        ),
+                        _ => unreachable!(),
+                    };
+                    let mut cm = m.mask_chunks();
+                    let mut output = Vec::new();
+                    let mut offset = 0;
+                    while offset < input.len() {
+                        let chunk_len =
+                            rng.gen_range(0..(std::cmp::min(10, input.len() - offset + 1)));
+                        let mut chunk = Vec::new();
+                        for _ in 0..chunk_len {
+                            chunk.push(input[offset]);
+                            offset += 1;
+                        }
+                        output.extend_from_slice(cm.mask_chunk(chunk).as_ref());
+                    }
+                    output.extend(cm.finish().as_slice());
+
+                    let check = mask_slice_check_with_prefixes(
+                        &input,
+                        "ABCD=EFGH=IJKL=MNOP",
+                        &keys,
+                        &pfxes,
                     );
                     for key in keys.iter() {
                         assert!(
