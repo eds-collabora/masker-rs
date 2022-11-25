@@ -1,6 +1,6 @@
 [package]
 name = "masker"
-version = "0.0.2"
+version = "0.0.3"
 authors = ["Edmund Smith <ed.smith@collabora.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
