@@ -11,107 +11,193 @@
 //!   example if two patterns are present and overlap, then replacing
 //!   either of them first leaves characters from the other visible.
 
-use core::cmp::max;
-use core::fmt::{Debug, Display, Error, Formatter};
+#![warn(missing_docs)]
+use core::fmt::{Debug, Error, Formatter};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Default, Eq, PartialEq)]
-struct Match<'a> {
-    input: &'a [u8],
+/// A pattern to mask
+///
+/// This consists of an optional fixed prefix, which must match in
+/// sequence, followed by an optional suffix drawn from a given
+/// alphabet. Either the prefix or suffix can be empty. The prefix, if
+/// present, can be masked or preserved.
+#[derive(Clone, Eq, PartialEq)]
+pub struct MatchData<'a> {
+    /// A fixed sequence of bytes to match.
+    ///
+    /// This may be empty, in which case any suffix bytes anywhere
+    /// in the input will be masked.
+    pub prefix: &'a [u8],
+    /// A set of bytes to match after the prefix.
+    ///
+    /// This is not a sequence, we match a sequence of bytes drawn
+    /// from suffix in any order. This may be empty.
+    pub suffix: &'a [u8],
+    /// If true, the prefix itself is masked, if false the prefix is
+    /// preserved.
+    pub mask_prefix: bool,
+}
+
+impl<'a> Debug for MatchData<'a> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
+        write!(
+            f,
+            "[PDATA {:?} {:?}{}]",
+            String::from_utf8_lossy(self.prefix),
+            String::from_utf8_lossy(self.suffix),
+            if self.mask_prefix { " MP" } else { "" },
+        )
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct Match<'a, 'b>
+where
+    'b: 'a,
+{
+    data: &'a MatchData<'b>,
+    match_idx: usize,
     offset: usize,
 }
 
-impl<'a> Match<'a> {
-    pub fn new(input: &'a [u8], offset: usize) -> Self {
-        Self { input, offset }
-    }
-
-    pub fn next(&self) -> u8 {
-        self.input[self.offset]
-    }
-
-    pub fn len(&self) -> usize {
-        self.input.len()
-    }
-
-    pub fn prefix_length(&self) -> usize {
-        self.offset
-    }
-
-    pub fn try_next(&self, action: u8) -> Option<Self> {
-        if action == self.input[self.offset] && self.offset + 1 < self.input.len() {
-            Some(Match::new(self.input, self.offset + 1))
-        } else {
-            None
+impl<'a, 'b> Match<'a, 'b> {
+    pub fn new(data: &'a MatchData<'b>, match_idx: usize, offset: usize) -> Self {
+        Self {
+            data,
+            match_idx,
+            offset,
         }
     }
 
-    pub fn completed_by(&self, action: u8) -> bool {
-        action == self.input[self.offset] && self.offset + 1 == self.input.len()
+    pub fn index(&self) -> usize {
+        self.match_idx
+    }
+
+    pub fn past_offset(&self, offset: &usize) -> bool {
+        self.offset >= *offset
+    }
+
+    pub fn allowed_next(&self) -> &'_ [u8] {
+        if self.offset < self.data.prefix.len() {
+            &self.data.prefix[self.offset..self.offset + 1]
+        } else {
+            self.data.suffix
+        }
+    }
+
+    pub fn try_next(&self, action: u8) -> (Option<Self>, Option<(usize, usize)>) {
+        if self.offset < self.data.prefix.len() {
+            if action == self.data.prefix[self.offset] {
+                let offset = self.offset + 1;
+                let span = (self.data.mask_prefix && offset == self.data.prefix.len())
+                    .then_some((self.data.prefix.len(), 0));
+                (Some(Match::new(self.data, self.match_idx, offset)), span)
+            } else {
+                (None, None)
+            }
+        } else if self.data.suffix.contains(&action) {
+            if !self.data.prefix.is_empty() {
+                // distinguish having matched the prefix from having matched the
+                // prefix AND having matched something in the suffix
+                let offset = std::cmp::min(self.offset + 1, self.data.prefix.len() + 2);
+                let span = if self.data.mask_prefix && !self.data.prefix.is_empty() {
+                    Some((2, 0))
+                } else {
+                    Some((offset - self.data.prefix.len(), 0))
+                };
+                (Some(Match::new(self.data, self.match_idx, offset)), span)
+            } else {
+                // We're matching bare characters, so there's no
+                // prefix check, and no interesting state to keep
+                (None, Some((1, 0)))
+            }
+        } else {
+            (None, None)
+        }
+    }
+
+    /// How many characters back could potentially mask
+    pub fn prefix_length(&self) -> usize {
+        let pfx = if self.data.mask_prefix {
+            self.offset
+        } else {
+            0
+        };
+
+        if self.offset < self.data.prefix.len() + 1 {
+            pfx
+        } else {
+            pfx + (self.offset - self.data.prefix.len())
+        }
     }
 }
 
-impl<'a> Display for Match<'a> {
+impl<'a, 'b> Debug for Match<'a, 'b> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         write!(
             f,
-            "[MATCH '{}' {}]",
-            String::from_utf8_lossy(self.input),
+            "[PREFIX '{}' '{}' {}]",
+            String::from_utf8_lossy(self.data.prefix),
+            String::from_utf8_lossy(self.data.suffix),
             self.offset
         )
     }
 }
 
-impl<'a> Debug for Match<'a> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-        write!(
-            f,
-            "[MATCH '{}' {}]",
-            String::from_utf8_lossy(self.input),
-            self.offset
-        )
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct State<'a> {
-    matches: Vec<Match<'a>>,
+#[derive(Clone, Default, PartialEq, Eq)]
+struct State<'a, 'b> {
+    matches: Vec<Match<'a, 'b>>,
     text: Vec<u8>,
     spans: Vec<(usize, usize)>,
+    text_offset: usize,
 }
 
-impl<'a> State<'a> {
-    fn new(matches: Vec<Match<'a>>, text: Vec<u8>, spans: Vec<(usize, usize)>) -> Self {
+impl<'a, 'b> State<'a, 'b> {
+    fn new(
+        matches: Vec<Match<'a, 'b>>,
+        text: Vec<u8>,
+        spans: Vec<(usize, usize)>,
+        text_offset: usize,
+    ) -> Self {
         Self {
             matches,
             text,
             spans,
+            text_offset,
         }
     }
 
-    fn generate_actions<S>(&self, strings: &[S]) -> Vec<Option<u8>>
-    where
-        S: AsRef<[u8]>,
-    {
+    fn generate_actions(&self, datas: &[MatchData]) -> Vec<Option<u8>> {
         let mut res = Vec::new();
-        for mtch in self.matches.iter() {
-            let ch = mtch.next();
-            if !res.contains(&Some(ch)) {
-                res.push(Some(ch));
+        for pfx in self.matches.iter() {
+            for ch in pfx.allowed_next() {
+                if !res.contains(&Some(*ch)) {
+                    res.push(Some(*ch));
+                }
             }
         }
-        for input in strings.iter() {
-            let ch = input.as_ref()[0];
-            if !res.contains(&Some(ch)) {
-                res.push(Some(ch));
+
+        for data in datas.iter() {
+            if !data.prefix.is_empty() {
+                let ch = data.prefix[0];
+                if !res.contains(&Some(ch)) {
+                    res.push(Some(ch))
+                }
+            } else {
+                for ch in data.suffix.as_ref().iter() {
+                    if !res.contains(&Some(*ch)) {
+                        res.push(Some(*ch))
+                    }
+                }
             }
         }
+
         res.push(None);
         res
     }
 }
 
-impl<'a> std::fmt::Display for State<'a> {
+impl<'a, 'b> std::fmt::Debug for State<'a, 'b> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         write!(
             f,
@@ -120,13 +206,14 @@ impl<'a> std::fmt::Display for State<'a> {
             self.spans
         )?;
         for s in self.matches.iter() {
-            write!(f, " {}", s)?;
+            write!(f, " {:?}", s)?;
         }
+        write!(f, " TxtOff: {}", self.text_offset)?;
         write!(f, "]")
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Clone, Default, PartialEq, Eq, Ord, PartialOrd)]
 struct Link {
     source: usize,
     target: usize,
@@ -145,7 +232,7 @@ impl Link {
     }
 }
 
-impl Display for Link {
+impl Debug for Link {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         write!(
             f,
@@ -244,40 +331,55 @@ impl DefaultLinks {
 }
 
 fn unify_spans(spans: &[(usize, usize)]) -> Vec<(usize, usize)> {
-    let mut res = Vec::<(usize, usize)>::new();
-    let mut new_res = Vec::<(usize, usize)>::new();
-    for span in spans.iter() {
-        let (mut x1, mut x2) = *span;
-        for old_span in res.iter() {
-            if span.0 < old_span.0 {
-                if span.1 <= old_span.0 {
-                    new_res.push(*old_span);
-                } else {
-                    x2 = max(x2, old_span.1)
-                }
-            } else if old_span.1 <= span.0 {
-                new_res.push(*old_span);
-            } else {
-                x1 = old_span.0;
-                x2 = max(x2, old_span.1);
-            }
-        }
-        new_res.push((x1, x2));
-        std::mem::swap(&mut res, &mut new_res);
-        new_res.clear()
+    if spans.is_empty() {
+        return Vec::new();
     }
+
+    let mut buf = spans.to_vec();
+    buf.sort();
+    let mut res = Vec::new();
+
+    let mut cur_span = buf.first().copied().unwrap();
+    for span in buf.iter() {
+        let new_cur_span = if span.0 < cur_span.1 {
+            (cur_span.0, std::cmp::max(cur_span.1, span.1))
+        } else {
+            res.push(cur_span);
+            *span
+        };
+        cur_span = new_cur_span;
+    }
+    res.push(cur_span);
+
     res
 }
 
-fn mask_spans<'a>(spans: &[(usize, usize)], input: &'a [u8], mask: &[u8]) -> Vec<u8> {
+fn mask_spans<'a>(
+    spans: &[(usize, usize)],
+    input: &'a [u8],
+    mask: &[u8],
+    offset: usize,
+) -> Vec<u8> {
     let mut res = Vec::new();
     let mut span = 0;
-    for (i, ch) in input.iter().enumerate() {
+
+    while span < spans.len() {
+        if spans[span].0 >= offset {
+            break;
+        }
+        res.extend_from_slice(mask);
+        if spans[span].1 > offset {
+            break;
+        }
+        span += 1;
+    }
+
+    for (i, ch) in input.iter().enumerate().map(|(i, ch)| (i + offset, ch)) {
         if span == spans.len() || i < spans[span].0 {
             res.push(*ch);
         } else {
             if i == spans[span].0 {
-                res.extend(mask.iter());
+                res.extend_from_slice(mask);
             }
             if i + 1 == spans[span].1 {
                 span += 1;
@@ -340,13 +442,90 @@ impl Masker {
         S: AsRef<[u8]>,
         T: AsRef<[u8]>,
     {
-        let mut states: Vec<State<'_>> = vec![Default::default()];
+        Self::new_with_match_data(input_data, &[], mask)
+    }
+
+    /// Create a new masker with prefix support
+    ///
+    /// `input_data` are the things you want to mask in any data
+    /// that is given to the masker. `mask` is the replacement you
+    /// want instead of those input data.
+    ///
+    /// `match_data` is a slice of [`MatchData`] objects that describe
+    /// some prefix/suffix pairs you would like to mask. This is
+    /// strictly a superset of the capabilities provided in `input_data`,
+    /// it's just less convenient to construct. Any entry in `input_data`
+    /// is equivalent to a [`MatchData`] with the prefix set to the value,
+    /// suffix empty, amd `mask_prefix` set to `true`.
+    ///
+    /// This builds a finite state machine capable of processing
+    /// the given inputs and mask, and has non-negligible cost,
+    /// similiar to a regex compilation.
+    ///
+    /// Note that it is permissible for the input data to have
+    /// overlaps, e.g. the case where you mask "cater" and "bobcat" is
+    /// handled. This extends to the case of token prefixes.
+    ///
+    /// Example:
+    /// ```rust
+    /// use masker::{Masker, MatchData};
+    ///
+    /// let input_data: &[&str] = &[];
+    /// let match_data = &[ MatchData { prefix: "secret".as_ref(), suffix: "abc".as_ref(), mask_prefix: true } ];
+    /// let m = Masker::new_with_match_data(input_data, match_data, "XXXX".as_bytes());
+    /// let s = m.mask_str("what does secretbaaa do?");
+    /// assert_eq!(s.as_str(), "what does XXXX do?");
+    /// ```
+    pub fn new_with_match_data<S, T>(input_data: &[S], match_data: &[MatchData], mask: T) -> Masker
+    where
+        S: AsRef<[u8]>,
+        T: AsRef<[u8]>,
+    {
+        let prefix_data = input_data
+            .iter()
+            .map(|s| MatchData {
+                prefix: s.as_ref(),
+                suffix: &[],
+                mask_prefix: true,
+            })
+            .chain(match_data.iter().cloned())
+            .collect::<Vec<_>>();
+
+        let mut states: Vec<State<'_, '_>> = vec![Default::default()];
         let mut links = Vec::new();
         let mut default_links = BTreeMap::new();
         let mut work = vec![0usize];
 
+        let mut coverage = BTreeMap::new();
+        for d1 in 0..prefix_data.len() {
+            for d2 in 0..prefix_data.len() {
+                let mut failed = false;
+                // First try to match d2's prefix, starting at this point
+                for j in 0..prefix_data[d2].prefix.len() {
+                    if !prefix_data[d1].suffix.contains(&prefix_data[d2].prefix[j]) {
+                        failed = true;
+                        break;
+                    }
+                }
+                if failed {
+                    continue;
+                }
+                for ch in prefix_data[d2].suffix {
+                    if !prefix_data[d1].suffix.contains(ch) {
+                        failed = true;
+                        break;
+                    }
+                }
+                if failed {
+                    continue;
+                }
+                // So now they cover
+                coverage.insert((d1, d2), prefix_data[d1].prefix.len() + 1);
+            }
+        }
+
         while let Some(index) = work.pop() {
-            let actions = states[index].generate_actions(input_data);
+            let actions = states[index].generate_actions(&prefix_data);
 
             for action in actions {
                 // STEP 1: Find the new matches, and spans of completed matches
@@ -359,28 +538,51 @@ impl Masker {
                     }
                     t
                 };
+                let text_offset = states[index].text_offset;
+                let full_text_len = new_text.len() + text_offset;
 
                 if let Some(action) = action {
-                    for mtch in states[index].matches.iter() {
-                        if let Some(new_match) = mtch.try_next(action) {
-                            new_matches.push(new_match);
-                        } else if mtch.completed_by(action) {
+                    for pfx in states[index].matches.iter() {
+                        let (pfx, span) = pfx.try_next(action);
+                        if let Some(new_pfx) = pfx {
+                            if !new_matches.contains(&new_pfx) {
+                                new_matches.push(new_pfx);
+                            }
+                        }
+                        if let Some((s1, s2)) = span {
                             new_spans.push((
-                                new_text.len() - std::cmp::min(new_text.len(), mtch.len()),
-                                new_text.len(),
-                            ))
+                                full_text_len - std::cmp::min(full_text_len, s1),
+                                full_text_len - std::cmp::min(full_text_len, s2),
+                            ));
                         }
                     }
 
-                    for input in input_data.iter() {
-                        let mtch = Match::new(input.as_ref(), 0);
-                        if let Some(new_match) = mtch.try_next(action) {
-                            new_matches.push(new_match)
-                        } else if mtch.completed_by(action) {
+                    for (ix, data) in prefix_data.iter().enumerate() {
+                        let mut covered = false;
+                        for pfx in states[index].matches.iter() {
+                            if let Some(start) = coverage.get(&(pfx.index(), ix)) {
+                                if pfx.past_offset(start) {
+                                    covered = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if covered {
+                            continue;
+                        }
+
+                        let pfx = Match::new(data, ix, 0);
+                        let (pfx, span) = pfx.try_next(action);
+                        if let Some(new_pfx) = pfx {
+                            if !new_matches.contains(&new_pfx) {
+                                new_matches.push(new_pfx);
+                            }
+                        }
+                        if let Some((s1, s2)) = span {
                             new_spans.push((
-                                new_text.len() - std::cmp::min(new_text.len(), mtch.len()),
-                                new_text.len(),
-                            ))
+                                full_text_len - std::cmp::min(full_text_len, s1),
+                                full_text_len - std::cmp::min(full_text_len, s2),
+                            ));
                         }
                     }
                 }
@@ -395,13 +597,12 @@ impl Masker {
                     .map(|m| m.prefix_length())
                     .max()
                     .unwrap_or(0usize);
-                let mut first_kept_char =
-                    new_text.len() - std::cmp::min(new_text.len(), new_extent);
+                let mut first_kept_char = full_text_len - std::cmp::min(full_text_len, new_extent);
 
                 for (x1, x2) in unified_spans {
                     // This span does not overlap with any span we are
                     // building
-                    if x2 + new_extent <= new_text.len() {
+                    if x2 + new_extent <= full_text_len {
                         emitted_spans.push((x1, x2));
                     } else {
                         kept_spans.push((x1, x2));
@@ -412,17 +613,28 @@ impl Masker {
                 }
 
                 let emitted_text = if first_kept_char > 0 {
-                    Some(mask_spans(
+                    let s = mask_spans(
                         &emitted_spans,
-                        &new_text[0..first_kept_char],
+                        &new_text[0..(first_kept_char - text_offset)],
                         mask.as_ref(),
-                    ))
+                        text_offset,
+                    );
+                    if !s.is_empty() {
+                        Some(s)
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 };
 
                 // Prune all emitted text
-                let new_text = &new_text[first_kept_char..];
+                let (new_text, new_text_offset) = if first_kept_char > text_offset {
+                    (&new_text[(first_kept_char - text_offset)..], 0)
+                } else {
+                    (new_text.as_slice(), text_offset - first_kept_char)
+                };
+
                 // Rebase spans for pruning
                 let mut kept_spans = kept_spans
                     .into_iter()
@@ -434,7 +646,7 @@ impl Masker {
                 //         replacing it with an empty span to mark the spot
                 let cleared = if let Some(first_span) = kept_spans.first().copied() {
                     if first_span.0 == 0 && first_span.1 > 0 {
-                        first_span.1 - 1
+                        first_span.1
                     } else {
                         0
                     }
@@ -442,13 +654,31 @@ impl Masker {
                     0
                 };
 
-                let new_text = &new_text[cleared..];
-                let kept_spans = kept_spans
-                    .into_iter()
-                    .map(|(a, b)| (a - std::cmp::min(a, cleared), b - std::cmp::min(b, cleared)))
-                    .collect::<Vec<_>>();
+                let (new_text, new_text_offset) = if cleared > 0 {
+                    if cleared > new_text_offset {
+                        (&new_text[(cleared - new_text_offset)..], 1)
+                    } else {
+                        (new_text, new_text_offset - cleared + 1)
+                    }
+                } else {
+                    (new_text, 0)
+                };
+                let kept_spans = if cleared > 0 {
+                    kept_spans
+                        .into_iter()
+                        .map(|(a, b)| {
+                            (
+                                a - std::cmp::min(a, cleared - 1),
+                                b - std::cmp::min(b, cleared - 1),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    kept_spans
+                };
 
-                let new_state = State::new(new_matches, new_text.to_vec(), kept_spans);
+                let new_state =
+                    State::new(new_matches, new_text.to_vec(), kept_spans, new_text_offset);
 
                 let new_index = if let Some(new_index) = states.iter().position(|x| x == &new_state)
                 {
