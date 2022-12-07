@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 //! # masker
 //!
 //! This crate provides an object [`Masker`] which can replace
@@ -10,10 +12,28 @@
 //! - It handles the case where masked regions blend together, for
 //!   example if two patterns are present and overlap, then replacing
 //!   either of them first leaves characters from the other visible.
-
+//!
+//! There are the following features:
+#![cfg_attr(
+    feature = "streams",
+    doc = r##"
+ - `"streams"` - Mask [`Stream`] implementations by wrapping them.
+"##
+)]
+#![cfg_attr(
+    not(feature = "streams"),
+    doc = r##"
+ - `"streams"` - Support for masking streams.
+"##
+)]
 #![warn(missing_docs)]
 use core::fmt::{Debug, Error, Formatter};
 use std::collections::BTreeMap;
+
+#[cfg(feature = "streams")]
+use bytes::Bytes;
+#[cfg(feature = "streams")]
+use futures::stream::Stream;
 
 /// A pattern to mask
 ///
@@ -236,7 +256,7 @@ impl Debug for Link {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         write!(
             f,
-            "[LINK {} -> {} '{}' ({}){}",
+            "[LINK {} -> {} '{}' ({}){}]",
             self.source,
             self.target,
             char::from_u32(self.action as u32).unwrap_or('?'),
@@ -784,6 +804,19 @@ impl Masker {
     pub fn mask_chunks(&self) -> ChunkMasker<'_> {
         ChunkMasker::new(self)
     }
+
+    /// Wrap a [`Stream`] producing a new one whose content is masked.
+    ///
+    /// The error type of the underlying stream is preserved, since
+    /// the [`Masker`] does not produce its own errors. This is only
+    /// available on the crate feature `streams`.
+    #[cfg(feature = "streams")]
+    pub fn mask_stream<S, E>(&self, stream: S) -> streams::MaskedStream<'_, S, E>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+    {
+        streams::MaskedStream::new(stream, self)
+    }
 }
 
 /// Mask a sequence of data blocks
@@ -843,6 +876,79 @@ impl<'a> ChunkMasker<'a> {
             res.extend(emitted);
         }
         res
+    }
+}
+
+#[cfg(feature = "streams")]
+mod streams {
+    use super::{ChunkMasker, Masker};
+
+    use bytes::Bytes;
+    use core::task::Poll;
+    use futures::Stream;
+
+    pub struct MaskedStream<'a, S, E>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+    {
+        base: S,
+        mask: Option<ChunkMasker<'a>>,
+        completed: bool,
+    }
+
+    impl<'a, S, E> MaskedStream<'a, S, E>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+    {
+        pub fn new(base: S, masker: &'a Masker) -> Self {
+            Self {
+                base,
+                mask: Some(masker.mask_chunks()),
+                completed: false,
+            }
+        }
+    }
+
+    impl<'a, S, E> Stream for MaskedStream<'a, S, E>
+    where
+        S: Stream<Item = Result<Bytes, E>> + Unpin,
+    {
+        type Item = Result<Bytes, E>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            let me = self.get_mut();
+            loop {
+                match me.completed {
+                    true => {
+                        return Poll::Ready(None);
+                    }
+                    false => match core::pin::Pin::new(&mut me.base).poll_next(cx) {
+                        Poll::Ready(Some(Ok(bytes))) => {
+                            let b = me.mask.as_mut().unwrap().mask_chunk(bytes);
+                            if !b.is_empty() {
+                                return Poll::Ready(Some(Ok(b.into())));
+                            }
+                        }
+                        Poll::Ready(Some(Err(e))) => {
+                            return Poll::Ready(Some(Err(e)));
+                        }
+                        Poll::Ready(None) => {
+                            me.completed = true;
+                            let b = me.mask.take().unwrap().finish();
+                            if !b.is_empty() {
+                                return Poll::Ready(Some(Ok(b.into())));
+                            }
+                        }
+                        Poll::Pending => {
+                            return Poll::Pending;
+                        }
+                    },
+                }
+            }
+        }
     }
 }
 
@@ -1957,6 +2063,84 @@ mod test {
                     assert_eq!(output, check);
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "streams")]
+    mod streams {
+        use bytes::Bytes;
+        use core::convert::Infallible;
+        use core::pin::Pin;
+        use core::task::{Context, Poll};
+        use futures::{Stream, StreamExt};
+
+        use crate::Masker;
+
+        struct StringStream<'a> {
+            data: &'a str,
+            offset: usize,
+        }
+
+        impl<'a> StringStream<'a> {
+            pub fn new(data: &'a str) -> Self {
+                Self { data, offset: 0 }
+            }
+        }
+
+        impl<'a> Stream for StringStream<'a> {
+            type Item = Result<Bytes, Infallible>;
+
+            fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+                let this = self.get_mut();
+                if this.offset < this.data.len() {
+                    let ch = &this.data.as_bytes()[this.offset..this.offset + 1];
+                    this.offset += 1;
+                    Poll::Ready(Some(Ok(Bytes::copy_from_slice(ch))))
+                } else {
+                    Poll::Ready(None)
+                }
+            }
+        }
+
+        async fn aggregate<T, E>(mut s: T) -> Result<Bytes, E>
+        where
+            T: Stream<Item = Result<Bytes, E>> + Unpin,
+            E: core::fmt::Debug,
+        {
+            let mut v = Vec::new();
+            while let Some(r) = s.next().await {
+                match r {
+                    Ok(bytes) => v.extend_from_slice(&bytes),
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(v.into())
+        }
+
+        #[tokio::test]
+        async fn test_stream_sanity() {
+            let m = Masker::new(&["abcd", "1ab", "cde", "bce", "aa"], "-MASKED-");
+
+            assert_eq!(
+                aggregate(m.mask_stream(StringStream::new("1abcdef")))
+                    .await
+                    .unwrap(),
+                "-MASKED-f"
+            );
+            assert_eq!(
+                aggregate(m.mask_stream(StringStream::new("1a")))
+                    .await
+                    .unwrap(),
+                "1a"
+            );
+            assert_eq!(
+                aggregate(m.mask_stream(StringStream::new("qqcdeblah")))
+                    .await
+                    .unwrap(),
+                "qq-MASKED-blah"
+            );
         }
     }
 }

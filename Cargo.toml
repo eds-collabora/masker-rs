@@ -1,6 +1,6 @@
 [package]
 name = "masker"
-version = "0.0.3"
+version = "0.0.4"
 authors = ["Edmund Smith <ed.smith@collabora.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -10,6 +10,16 @@ keywords = [ "text", "utility", "search" ]
 categories = [ "algorithms", "text-processing" ]
 
 [dependencies]
+bytes = { version = "1", optional = true }
+futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
 rand = "0.8"
+tokio = { version = "1", features=["macros", "rt"] }
+
+[features]
+streams = ["bytes", "futures"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
